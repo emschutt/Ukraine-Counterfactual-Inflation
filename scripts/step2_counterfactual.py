@@ -11,7 +11,7 @@ Counterfactual interpretation:
 Methods:
   - Factor benchmark  (Ciccarelli & Mojon 2010)
   - Local projections (Jorda 2005) -- stable-period calibration + regime weighting
-  - Structural VAR    (Sims 1980; Kilian & Lutkepohl 2017) -- Cholesky identification
+  - Structural VAR    (Bayoumi & Eichengreen 1993; Blanchard & Quah 1989) -- long-run identification
   - Augmented synthetic control (Abadie et al. 2010)
   - Median ensemble of LP / SVAR / ASCM
 """
@@ -194,65 +194,105 @@ def local_projection_counterfactual(df: pd.DataFrame) -> tuple[pd.Series, OLS]:
 
 
 # ===================================================================
-# Method 3: Structural VAR (Sims 1980)
+# Method 3: Blanchard-Quah SVAR (Bayoumi & Eichengreen 1993)
 # ===================================================================
 
-def svar_counterfactual(df: pd.DataFrame, maxlags: int = 6, ma_horizon: int = 12):
+def blanchard_quah_identify(var_result, ma_convergence: int = 200):
     """
-    Cholesky ordering: [EA_FACTOR, BRENT_YOY, FX_DEPR, POLICY_SHOCK, UA]
+    Blanchard-Quah (1989) long-run identification for a bivariate VAR.
 
-    External/slow-moving variables first (EA common factor, oil prices),
-    then faster financial variables (FX depreciation, policy shock),
-    with Ukraine's inflation last. Consistent with small-open-economy SVAR
-    orderings (Kilian & Lutkepohl 2017, ch. 10).
+    Variables: [output_growth, inflation]
+    Restriction: demand shocks have zero long-run effect on output.
 
-    The counterfactual removes only *inflationary* FX and policy structural
-    shocks (clamped at zero). Under Euro membership Ukraine loses the
-    devaluation channel and independent policy, but we do not reverse periods
-    where those channels were disinflationary — the counterfactual should
-    never exceed actual inflation.
+    Returns structural impact matrix S, structural shocks, and C(1).
     """
-    var_cols = ["EA_FACTOR", "BRENT_YOY", "FX_DEPR", "POLICY_SHOCK", "UA"]
-    sample = df[var_cols].dropna().copy()
-    model = VAR(sample)
-    selected = model.select_order(maxlags=maxlags).selected_orders["bic"]
-    lag_order = max(1, selected or 1)
-    res = model.fit(lag_order)
+    ma = var_result.ma_rep(ma_convergence)
+    C1 = ma.sum(axis=0)  # long-run multiplier
+    sigma_u = var_result.sigma_u.to_numpy()
+    F = C1 @ sigma_u @ C1.T
+    F += np.eye(2) * 1e-12  # numerical stability
+    P = np.linalg.cholesky(F)
+    S = np.linalg.solve(C1, P)
+    shocks = np.linalg.solve(S, var_result.resid.to_numpy().T).T
+    return S, shocks, C1
 
-    sigma = res.sigma_u.to_numpy()
-    chol = np.linalg.cholesky(sigma)
-    residuals = res.resid.to_numpy()
-    effective_index = res.resid.index
-    sample_eff = sample.loc[effective_index]
-    shocks = np.linalg.solve(chol, residuals.T).T
 
-    ma = res.ma_rep(ma_horizon)
-    structural_irf = np.array([ma_h @ chol for ma_h in ma])
+def svar_counterfactual(df: pd.DataFrame, maxlags: int = 12, ma_horizon: int = 60):
+    """
+    Bayoumi-Eichengreen (1993) / Blanchard-Quah (1989) SVAR.
 
-    idx_ua = var_cols.index("UA")
-    idx_fx = var_cols.index("FX_DEPR")
-    idx_policy = var_cols.index("POLICY_SHOCK")
+    Bivariate VARs: [output_growth, inflation] for UA and EA separately.
+    Long-run restriction: demand shocks have zero cumulative effect on output.
 
-    fx_weight = df.loc[effective_index, "fx_channel_weight"].to_numpy()
-    policy_weight = df.loc[effective_index, "policy_channel_weight"].to_numpy()
+    Counterfactual: under Euro membership, Ukraine's demand conditions are
+    set by EA-wide dynamics. Replace Ukraine's demand shocks with EA demand
+    shocks in the historical decomposition.
+    """
+    # --- Ukraine bivariate VAR ---
+    bq_ua = df[["UA_IP_YOY", "UA"]].dropna().copy()
+    bq_ua.columns = ["dy", "pi"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=ValueWarning)
+        model_ua = VAR(bq_ua)
+        lag_ua = max(1, model_ua.select_order(maxlags=maxlags).selected_orders.get("bic", 2) or 2)
+        res_ua = model_ua.fit(lag_ua)
+    S_ua, shocks_ua, C1_ua = blanchard_quah_identify(res_ua)
 
-    removed_fx = np.zeros(len(sample_eff))
-    removed_policy = np.zeros(len(sample_eff))
+    # --- EA bivariate VAR ---
+    bq_ea = df[["EA_IP_YOY", "EA_MEAN"]].dropna().copy()
+    bq_ea.columns = ["dy", "pi"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=ValueWarning)
+        model_ea = VAR(bq_ea)
+        lag_ea = max(1, model_ea.select_order(maxlags=maxlags).selected_orders.get("bic", 2) or 2)
+        res_ea = model_ea.fit(lag_ea)
+    S_ea, shocks_ea, C1_ea = blanchard_quah_identify(res_ea)
 
-    for t in range(len(sample_eff)):
+    # --- Historical decomposition counterfactual ---
+    idx_pi = 1   # inflation is second variable
+    idx_demand = 1  # demand shock is second structural shock
+
+    # Structural IRFs for both economies
+    ma_ua = res_ua.ma_rep(ma_horizon)
+    sirf_ua = np.array([m @ S_ua for m in ma_ua])
+    ma_ea = res_ea.ma_rep(ma_horizon)
+    sirf_ea = np.array([m @ S_ea for m in ma_ea])
+
+    # Align UA and EA shocks on common dates
+    ua_index = res_ua.resid.index
+    ea_index = res_ea.resid.index
+    common = ua_index.intersection(ea_index)
+
+    shocks_ua_df = pd.DataFrame(shocks_ua, index=ua_index, columns=["supply", "demand"])
+    shocks_ea_df = pd.DataFrame(shocks_ea, index=ea_index, columns=["supply", "demand"])
+    demand_ua = shocks_ua_df.loc[common, "demand"].to_numpy()
+    demand_ea = shocks_ea_df.loc[common, "demand"].to_numpy()
+
+    # Demand contribution to inflation: each economy uses its own IRF.
+    # This avoids amplification from mapping EA shocks through UA's
+    # more volatile structural response.
+    n = len(common)
+    demand_ua_contrib = np.zeros(n)
+    demand_ea_contrib = np.zeros(n)
+    for t in range(n):
         for h in range(min(ma_horizon, t) + 1):
-            source = t - h
-            removed_fx[t] += structural_irf[h, idx_ua, idx_fx] * shocks[source, idx_fx] * fx_weight[source]
-            removed_policy[t] += structural_irf[h, idx_ua, idx_policy] * shocks[source, idx_policy] * policy_weight[source]
+            demand_ua_contrib[t] += sirf_ua[h, idx_pi, idx_demand] * demand_ua[t - h]
+            demand_ea_contrib[t] += sirf_ea[h, idx_pi, idx_demand] * demand_ea[t - h]
 
-    # Only remove inflationary contributions (positive = added inflation)
-    removed_fx = np.clip(removed_fx, 0, None)
-    removed_policy = np.clip(removed_policy, 0, None)
-    removed_fx = pd.Series(removed_fx, index=effective_index, name="SVAR_removed_fx")
-    removed_policy = pd.Series(removed_policy, index=effective_index, name="SVAR_removed_policy")
-    cf = sample_eff["UA"] - removed_fx - removed_policy
+    removed_demand = demand_ua_contrib - demand_ea_contrib
+    removed_demand = pd.Series(removed_demand, index=common, name="SVAR_removed_demand")
+    actual_pi = df["UA"].reindex(common)
+    cf = actual_pi - removed_demand
     cf.name = "CF_svar"
-    return cf, removed_fx, removed_policy, res
+
+    bq_results = {
+        "res_ua": res_ua, "res_ea": res_ea,
+        "S_ua": S_ua, "S_ea": S_ea,
+        "shocks_ua": shocks_ua_df, "shocks_ea": shocks_ea_df,
+        "C1_ua": C1_ua, "C1_ea": C1_ea,
+        "lag_ua": lag_ua, "lag_ea": lag_ea,
+    }
+    return cf, removed_demand, bq_results
 
 
 # ===================================================================
@@ -308,54 +348,74 @@ def run_stationarity_tests(df: pd.DataFrame, var_cols: list[str]):
     print("  Note: VAR in levels valid for IRF (Sims, Stock & Watson 1990).")
 
 
-def svar_bootstrap_ci(df, svar_result, var_cols,
-                      n_boot=500, alpha=0.10, ma_horizon=12):
-    """Residual bootstrap for SVAR counterfactual confidence bands."""
+def svar_bootstrap_ci(df, bq_results, n_boot=500, alpha=0.10, ma_horizon=60):
+    """Residual bootstrap for B-Q SVAR counterfactual confidence bands.
+
+    Bootstraps the UA VAR only; EA shocks are held fixed (large-economy
+    assumption). This captures parameter uncertainty in the UA model.
+    """
     rng = np.random.default_rng(42)
-    effective_index = svar_result.resid.index
-    lag_order = svar_result.k_ar
-    fitted_values = svar_result.fittedvalues.to_numpy()
-    residuals = svar_result.resid.to_numpy()
+    res_ua = bq_results["res_ua"]
+    shocks_ea_df = bq_results["shocks_ea"]
+    lag_order = res_ua.k_ar
+    fitted_values = res_ua.fittedvalues.to_numpy()
+    residuals = res_ua.resid.to_numpy()
+    ua_index = res_ua.resid.index
     n_obs = len(residuals)
 
-    fx_weight = df.loc[effective_index, "fx_channel_weight"].to_numpy()
-    policy_weight = df.loc[effective_index, "policy_channel_weight"].to_numpy()
-    idx_ua, idx_fx, idx_policy = var_cols.index("UA"), var_cols.index("FX_DEPR"), var_cols.index("POLICY_SHOCK")
+    # EA demand contribution (fixed across bootstraps)
+    res_ea = bq_results["res_ea"]
+    S_ea = bq_results["S_ea"]
+    ea_index = res_ea.resid.index
+    common = ua_index.intersection(ea_index)
+    demand_ea = shocks_ea_df.loc[common, "demand"].to_numpy()
+    ma_ea = res_ea.ma_rep(ma_horizon)
+    sirf_ea = np.array([m @ S_ea for m in ma_ea])
 
-    boot_cfs = np.full((n_boot, n_obs), np.nan)
+    boot_cfs = np.full((n_boot, len(common)), np.nan)
     for b in range(n_boot):
         boot_resid = residuals[rng.integers(0, n_obs, size=n_obs)]
-        boot_df = pd.DataFrame(fitted_values + boot_resid, index=effective_index, columns=var_cols)
+        boot_data = pd.DataFrame(
+            fitted_values + boot_resid, index=ua_index, columns=["dy", "pi"]
+        )
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=ValueWarning)
-                bm = VAR(boot_df).fit(lag_order)
+                bm = VAR(boot_data).fit(lag_order)
+            S_b, shocks_b, _ = blanchard_quah_identify(bm)
         except Exception:
             continue
-        try:
-            chol_b = np.linalg.cholesky(bm.sigma_u.to_numpy())
-        except np.linalg.LinAlgError:
+
+        ma_b = bm.ma_rep(ma_horizon)
+        sirf_b = np.array([m @ S_b for m in ma_b])
+        bm_index = bm.resid.index
+        bm_common = bm_index.intersection(common)
+        n_c = len(bm_common)
+        if n_c < 10:
             continue
-        shocks_b = np.linalg.solve(chol_b, bm.resid.to_numpy().T).T
-        sirf_b = np.array([m @ chol_b for m in bm.ma_rep(ma_horizon)])
-        n_eff = len(bm.resid)
-        rem_fx = np.zeros(n_eff)
-        rem_pol = np.zeros(n_eff)
-        for t in range(n_eff):
+
+        shocks_b_df = pd.DataFrame(shocks_b, index=bm_index, columns=["supply", "demand"])
+        dem_ua_b = shocks_b_df.loc[bm_common, "demand"].to_numpy()
+        dem_ea_b = shocks_ea_df.loc[bm_common, "demand"].to_numpy()
+
+        removed = np.zeros(n_c)
+        for t in range(n_c):
             for h in range(min(ma_horizon, t) + 1):
-                s = t - h
-                rem_fx[t] += sirf_b[h, idx_ua, idx_fx] * shocks_b[s, idx_fx] * fx_weight[s]
-                rem_pol[t] += sirf_b[h, idx_ua, idx_policy] * shocks_b[s, idx_policy] * policy_weight[s]
-        removed = np.clip(rem_fx, 0, None) + np.clip(rem_pol, 0, None)
-        boot_actual = boot_df.iloc[lag_order:, idx_ua].to_numpy()
-        boot_cfs[b, lag_order:lag_order + n_eff] = boot_actual - removed
+                removed[t] += sirf_b[h, 1, 1] * dem_ua_b[t - h]
+                removed[t] -= sirf_ea[h, 1, 1] * dem_ea_b[t - h]
+
+        actual_b = boot_data.loc[bm_common, "pi"].to_numpy()
+        # Align to common index positions
+        pos = [list(common).index(d) for d in bm_common if d in common]
+        for i, p in enumerate(pos):
+            boot_cfs[b, p] = actual_b[i] - removed[i]
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         lo = np.nanpercentile(boot_cfs, 100 * alpha / 2, axis=0)
         hi = np.nanpercentile(boot_cfs, 100 * (1 - alpha / 2), axis=0)
-    return (pd.Series(lo, index=effective_index, name="CF_svar_ci_lo"),
-            pd.Series(hi, index=effective_index, name="CF_svar_ci_hi"))
+    return (pd.Series(lo, index=common, name="CF_svar_ci_lo"),
+            pd.Series(hi, index=common, name="CF_svar_ci_hi"))
 
 
 # ===================================================================
@@ -383,9 +443,8 @@ analysis["POLICY_SHOCK"] = analysis["POLICY_SPREAD_CHG"].fillna(0.0)
 # --- Run all methods ---
 cf_factor, factor_model = factor_benchmark(analysis)
 cf_lp, lp_model = local_projection_counterfactual(analysis)
-cf_svar, svar_removed_fx, svar_removed_policy, svar_model = svar_counterfactual(analysis)
-svar_var_cols = ["EA_FACTOR", "BRENT_YOY", "FX_DEPR", "POLICY_SHOCK", "UA"]
-svar_ci_lo, svar_ci_hi = svar_bootstrap_ci(analysis, svar_model, svar_var_cols, n_boot=500)
+cf_svar, svar_removed_demand, bq_results = svar_counterfactual(analysis)
+svar_ci_lo, svar_ci_hi = svar_bootstrap_ci(analysis, bq_results, n_boot=500)
 cf_ascm, donor_weights = augmented_synthetic_control(analysis, donor_panel)
 cf_main = median_counterfactual([cf_lp, cf_svar, cf_ascm])
 
@@ -420,9 +479,28 @@ for rn, sub in regimes.groupby("regime"):
           f" Cred={sub['credibility_gain_weight'].iloc[0]:.2f}"
           f" -> treatment={sub['euro_treatment_weight'].iloc[0]:.2f}")
 
-run_stationarity_tests(analysis, svar_var_cols)
+run_stationarity_tests(analysis, ["UA_IP_YOY", "UA", "EA_IP_YOY", "EA_MEAN"])
 
-print(f"\nSVAR: lag order (BIC) = {svar_model.k_ar}, MA horizon = 12")
+res_ua, res_ea = bq_results["res_ua"], bq_results["res_ea"]
+C1_ua, S_ua = bq_results["C1_ua"], bq_results["S_ua"]
+lr_check = (C1_ua @ S_ua)[0, 1]
+print(f"\nSVAR (Bayoumi-Eichengreen / Blanchard-Quah):")
+print(f"  Ukraine VAR: [UA_IP_YOY, UA], lag order (BIC) = {bq_results['lag_ua']}")
+print(f"  EA VAR:      [EA_IP_YOY, EA_MEAN], lag order (BIC) = {bq_results['lag_ea']}")
+print(f"  Long-run restriction check: C(1)@S [0,1] = {lr_check:.2e} (should be ~0)")
+
+shocks_ua = bq_results["shocks_ua"]
+shocks_ea = bq_results["shocks_ea"]
+common_shock = shocks_ua.index.intersection(shocks_ea.index)
+su_ua = shocks_ua.loc[common_shock, "supply"]
+su_ea = shocks_ea.loc[common_shock, "supply"]
+de_ua = shocks_ua.loc[common_shock, "demand"]
+de_ea = shocks_ea.loc[common_shock, "demand"]
+print(f"\nShock correlations (Bayoumi-Eichengreen Table 2):")
+print(f"  corr(supply_UA, supply_EA)  = {su_ua.corr(su_ea):+.4f}")
+print(f"  corr(demand_UA, demand_EA)  = {de_ua.corr(de_ea):+.4f}")
+print(f"  corr(supply_UA, demand_EA)  = {su_ua.corr(de_ea):+.4f}")
+print(f"  corr(demand_UA, supply_EA)  = {de_ua.corr(su_ea):+.4f}")
 
 print("\nCounterfactual gaps in key episodes:")
 for label, s, e in [
@@ -459,7 +537,7 @@ ea_mean = analysis["EA_MEAN"]
 fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharex=True, sharey=True)
 methods = [
     ("Local Projections", cf_lp, "teal", False),
-    ("Structural VAR", cf_svar, "navy", True),
+    ("Blanchard-Quah SVAR", cf_svar, "navy", True),
     ("Augmented Synthetic Control", cf_ascm, "darkorange", False),
     ("Factor Benchmark", cf_factor, "grey", False),
 ]
@@ -539,7 +617,7 @@ results = pd.DataFrame({
     "CF_factor_benchmark": cf_factor, "CF_local_projections": cf_lp,
     "CF_svar": cf_svar, "CF_svar_ci_lo": svar_ci_lo, "CF_svar_ci_hi": svar_ci_hi,
     "CF_augmented_synthetic_control": cf_ascm, "CF_main": cf_main,
-    "SVAR_removed_fx": svar_removed_fx, "SVAR_removed_policy": svar_removed_policy,
+    "SVAR_removed_demand": svar_removed_demand,
     "fx_channel_weight": regimes["fx_channel_weight"],
     "policy_channel_weight": regimes["policy_channel_weight"],
     "credibility_gain_weight": regimes["credibility_gain_weight"],
