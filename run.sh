@@ -21,7 +21,7 @@ echo "=== Step 1: Data Pipeline ==="
 "$PYTHON_BIN" scripts/step1_data_pipeline.py
 
 echo ""
-echo "=== Step 2: Counterfactual (Ciccarelli-Mojon Factor Model) ==="
+echo "=== Step 2: Counterfactual (SVAR + LP + donor benchmarks) ==="
 "$PYTHON_BIN" scripts/step2_counterfactual.py
 
 echo ""

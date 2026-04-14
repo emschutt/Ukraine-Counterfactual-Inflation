@@ -24,6 +24,8 @@ import matplotlib
 matplotlib.use("Agg")      # non-interactive backend for saving figures
 import matplotlib.pyplot as plt
 
+from external_data import build_external_macro_panel, get_extended_hicp_panel
+
 # =====================================================================
 # CONFIGURATION — adjust these paths to point at your local repo clone
 # =====================================================================
@@ -243,15 +245,30 @@ def plot_panel(panel: pd.DataFrame, save_path: str = "fig_inflation_panel.png"):
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.join(script_dir, "..")
-    os.makedirs(os.path.join(project_dir, "data"), exist_ok=True)
-    os.makedirs(os.path.join(project_dir, "figures"), exist_ok=True)
+    data_dir = os.path.join(project_dir, "data")
+    fig_dir = os.path.join(project_dir, "figures")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(fig_dir, exist_ok=True)
 
     panel = build_inflation_panel(UA_CSV, ECB_CSV, START, END)
     print_diagnostics(panel)
-    plot_panel(panel, save_path=os.path.join(project_dir, "figures", "fig_inflation_panel.png"))
+    plot_panel(panel, save_path=os.path.join(fig_dir, "fig_inflation_panel.png"))
 
     # Save the clean panel for use in subsequent steps
-    panel.to_csv(os.path.join(project_dir, "data", "data_clean_panel.csv"))
+    panel.to_csv(os.path.join(data_dir, "data_clean_panel.csv"))
     print("\nClean panel saved to: data_clean_panel.csv")
     print("Columns:", list(panel.columns))
-    print("\nData pipeline complete. Ready for Step 2 (SVAR estimation).")
+
+    print("\nFetching and caching external macro series...")
+    macro = build_external_macro_panel(START, END)
+    macro.to_csv(os.path.join(data_dir, "data_external_macro.csv"))
+    print("Saved: data_external_macro.csv")
+    print("External macro columns:", list(macro.columns))
+
+    print("\nFetching and caching expanded HICP donor panel...")
+    donor_panel = get_extended_hicp_panel(START, END)
+    donor_panel.to_csv(os.path.join(data_dir, "data_extended_hicp_panel.csv"))
+    print("Saved: data_extended_hicp_panel.csv")
+    print("Expanded donor countries:", list(donor_panel.columns))
+
+    print("\nData pipeline complete. Ready for Step 2 (SVAR, LP, and donor-based counterfactuals).")

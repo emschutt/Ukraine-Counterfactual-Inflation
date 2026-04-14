@@ -1,60 +1,43 @@
 #!/usr/bin/env python3
 """
-Part B — Counterfactual Inflation Analysis (Refined)
-=====================================================
-What would Ukraine's inflation have looked like had it been a Euro Area member?
+Part B — Multi-Method Counterfactual Inflation Analysis
+=======================================================
 
-Methodology
------------
-PRIMARY METHOD: Ciccarelli-Mojon (2010) Common Factor + Cross-Sectional Loading
+This script reworks Part B around the requirements of the exam:
+  - external macro data are fetched and merged in Step 1
+  - SVAR and Local Projections are the structural core methods
+  - factor models are kept as a benchmark
+  - an augmented synthetic-control style donor model is added as a modern
+    comparative benchmark
+  - Part A regime distinctions enter transparently through explicit regime
+    weights for the FX channel, policy channel, and credibility import
 
-  Step 1: Extract the common EA inflation factor via PCA from the 11-country panel.
-          Justify the number of components with scree analysis and Kaiser criterion.
-  Step 2: Estimate each EA country's loading (alpha_i, lambda_i) on this factor.
-  Step 3: Construct Ukraine's counterfactual loading using peripheral EA members.
-          Sensitivity: compare core, periphery, and all-EA loadings.
-  Step 4: Counterfactual = alpha_periphery + lambda_periphery * F_EA + premium
-  Step 5: Bootstrap the entire pipeline for 90% confidence intervals.
-
-COMPLEMENTARY REFINEMENTS:
-  - Data-driven treatment intensity using rolling FX co-movement
-  - Empirical credibility proxy from inflation-expectations gap
-  - Bai-Perron structural break tests to endogenise "quiet period" selection
-  - Automatic HAC bandwidth (Andrews method)
-
-Identification Assumptions
---------------------------
-A1. Under EA membership, Ukraine's inflation = common EA factor × country loading.
-A2. Ukraine's loading is estimated from within-EA cross-sectional variation
-    (peripheral EA members: GR, IE, PT, ES, FI).
-A3. The exchange-rate pass-through channel is eliminated under the euro.
-A4. Credibility import (Barro-Gordon 1983, Giavazzi-Pagano 1988) reduces the
-    structural inflation premium — proxied empirically by the gap between
-    Ukraine's realised inflation and the EA factor during stable periods.
-A5. Treatment intensity varies with Ukraine's actual monetary autonomy,
-    measured by rolling exchange-rate volatility (data-driven, not ad hoc).
-
-Author: Eduardo Schutt
+Counterfactual interpretation:
+  1. Euro adoption removes the hryvnia devaluation channel.
+  2. Euro adoption eliminates independent nominal-policy spread versus the ECB.
+  3. Euro adoption imports credibility, reducing Ukraine's inflation premium.
 """
 
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
+import os
+import warnings
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from matplotlib.gridspec import GridSpec
-from statsmodels.tsa.stattools import adfuller
+from scipy.optimize import minimize
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools.tools import add_constant
-import os
-import warnings
-warnings.filterwarnings("ignore")
+from statsmodels.tsa.api import VAR
 
+warnings.filterwarnings("ignore")
 np.random.seed(42)
 
-# =====================================================================
-# 0. PROJECT PATHS
-# =====================================================================
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.join(SCRIPT_DIR, "..")
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
@@ -64,538 +47,343 @@ os.makedirs(FIG_DIR, exist_ok=True)
 
 
 def fit_pca_standardized(df: pd.DataFrame):
-    """
-    Minimal PCA helper using NumPy SVD on an already standardized DataFrame.
-
-    Returns
-    -------
-    eigenvalues : np.ndarray
-    explained_ratio : np.ndarray
-    scores : np.ndarray
-        Principal component scores with shape (n_obs, n_components).
-    """
     x = df.to_numpy(dtype=float)
-    n_obs = x.shape[0]
-    u, s, vt = np.linalg.svd(x, full_matrices=False)
-    eigenvalues = (s ** 2) / (n_obs - 1)
+    u, s, _ = np.linalg.svd(x, full_matrices=False)
+    eigenvalues = (s ** 2) / (x.shape[0] - 1)
     explained_ratio = eigenvalues / eigenvalues.sum()
     scores = u * s
     return eigenvalues, explained_ratio, scores
 
-# =====================================================================
-# 0. LOAD DATA
-# =====================================================================
+
+def build_regime_map(index: pd.Index) -> pd.DataFrame:
+    idx = pd.to_datetime(index)
+    regimes = pd.DataFrame(index=idx)
+    regimes["regime"] = "peg_pre_2008"
+
+    regimes.loc[(idx >= "2008-09-01") & (idx <= "2009-12-01"), "regime"] = "gfc_devaluation"
+    regimes.loc[(idx >= "2010-01-01") & (idx <= "2014-01-01"), "regime"] = "repeg"
+    regimes.loc[(idx >= "2014-02-01") & (idx <= "2015-07-01"), "regime"] = "crimea_float_crisis"
+    regimes.loc[(idx >= "2015-08-01") & (idx <= "2022-01-01"), "regime"] = "inflation_targeting"
+    regimes.loc[(idx >= "2022-02-01") & (idx <= "2023-09-01"), "regime"] = "wartime_fixed"
+    regimes.loc[idx >= "2023-10-01", "regime"] = "managed_flexibility"
+
+    # What the euro changes, channel by channel.
+    fx_weights = {
+        "peg_pre_2008": 0.20,
+        "gfc_devaluation": 1.00,
+        "repeg": 0.20,
+        "crimea_float_crisis": 1.00,
+        "inflation_targeting": 0.70,
+        "wartime_fixed": 0.15,
+        "managed_flexibility": 0.50,
+    }
+    policy_weights = {
+        "peg_pre_2008": 0.15,
+        "gfc_devaluation": 0.65,
+        "repeg": 0.15,
+        "crimea_float_crisis": 0.85,
+        "inflation_targeting": 0.80,
+        "wartime_fixed": 0.10,
+        "managed_flexibility": 0.55,
+    }
+    credibility_weights = {
+        "peg_pre_2008": 1.00,
+        "gfc_devaluation": 1.00,
+        "repeg": 0.95,
+        "crimea_float_crisis": 0.90,
+        "inflation_targeting": 0.45,
+        "wartime_fixed": 0.35,
+        "managed_flexibility": 0.40,
+    }
+
+    regimes["fx_channel_weight"] = regimes["regime"].map(fx_weights).astype(float)
+    regimes["policy_channel_weight"] = regimes["regime"].map(policy_weights).astype(float)
+    regimes["credibility_gain_weight"] = regimes["regime"].map(credibility_weights).astype(float)
+    regimes["euro_treatment_weight"] = (
+        0.5 * regimes["fx_channel_weight"] + 0.3 * regimes["policy_channel_weight"] + 0.2 * regimes["credibility_gain_weight"]
+    )
+    regimes.index.name = "date"
+    return regimes
+
+
+def compute_ea_factor(ea_panel: pd.DataFrame):
+    ea_clean = ea_panel.dropna()
+    ea_z = (ea_clean - ea_clean.mean()) / ea_clean.std()
+    eigenvalues, explained_ratio, scores = fit_pca_standardized(ea_z)
+    factor_raw = pd.Series(scores[:, 0], index=ea_clean.index, name="EA_FACTOR_RAW")
+    ea_mean = ea_clean.mean(axis=1)
+    factor = (factor_raw - factor_raw.mean()) / factor_raw.std() * ea_mean.std() + ea_mean.mean()
+    factor.name = "EA_FACTOR"
+    return factor, eigenvalues, explained_ratio
+
+
+def estimate_credibility_shift(df: pd.DataFrame, regimes: pd.DataFrame):
+    rolling_vol = df["UA"].rolling(12).std()
+    stable_mask = (
+        (regimes["fx_channel_weight"] <= 0.20)
+        & (df["UA"].notna())
+        & (df["EA_FACTOR"].notna())
+        & (df.index < pd.Timestamp("2015-08-01"))
+        & (rolling_vol <= rolling_vol.quantile(0.40))
+    )
+    anchor = df["EA_FACTOR"].rename("FACTOR_ANCHOR")
+    raw_gap = (df["UA"] - anchor).where(stable_mask)
+    premium = raw_gap.clip(lower=0).median()
+    credibility_shift = regimes["credibility_gain_weight"] * premium
+    credibility_shift.name = "credibility_shift"
+    return anchor, premium, credibility_shift
+
+
+def factor_benchmark(df: pd.DataFrame, credibility_shift: pd.Series):
+    stable_mask = (df["UA"].notna()) & (df["EA_FACTOR"].notna()) & (df["fx_channel_weight"] <= 0.35)
+    model = OLS(df.loc[stable_mask, "UA"], add_constant(df.loc[stable_mask, "EA_FACTOR"])).fit(cov_type="HAC", cov_kwds={"maxlags": 12})
+    fitted = pd.Series(model.predict(add_constant(df["EA_FACTOR"], has_constant="add")), index=df.index, name="CF_factor_benchmark")
+    cf = fitted - credibility_shift
+    cf.name = "CF_factor_benchmark"
+    return cf, model
+
+
+def make_lagged_controls(df: pd.DataFrame, cols: list[str], nlags: int) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        for lag in range(1, nlags + 1):
+            out[f"{col}_lag{lag}"] = out[col].shift(lag)
+    return out
+
+
+def local_projection_counterfactual(df: pd.DataFrame, credibility_shift: pd.Series, horizons: int = 6, nlags: int = 3):
+    lp = make_lagged_controls(
+        df[[
+            "UA", "EA_FACTOR", "BRENT_YOY", "UA_IP_GAP", "EA_IP_YOY",
+            "FX_DEPR", "POLICY_SHOCK", "fx_channel_weight", "policy_channel_weight"
+        ]],
+        ["UA", "EA_FACTOR", "BRENT_YOY", "UA_IP_GAP", "EA_IP_YOY"],
+        nlags,
+    )
+    lp["FX_DEPR"] = lp["FX_DEPR"].clip(lp["FX_DEPR"].quantile(0.02), lp["FX_DEPR"].quantile(0.98))
+    lp["BRENT_YOY"] = lp["BRENT_YOY"].clip(lp["BRENT_YOY"].quantile(0.02), lp["BRENT_YOY"].quantile(0.98))
+    lp["FX_STATE"] = lp["FX_DEPR"] * lp["fx_channel_weight"]
+    lp["POLICY_STATE"] = lp["POLICY_SHOCK"] * lp["policy_channel_weight"]
+
+    base_cols = [
+        "FX_DEPR", "FX_STATE", "POLICY_SHOCK", "POLICY_STATE",
+        "EA_FACTOR", "BRENT_YOY", "UA_IP_GAP", "EA_IP_YOY",
+    ]
+    lag_cols = [c for c in lp.columns if "_lag" in c and not c.startswith(("FX_DEPR", "POLICY_SHOCK"))]
+    design_cols = base_cols + lag_cols
+
+    beta_fx = []
+    beta_fx_state = []
+    beta_policy = []
+    beta_policy_state = []
+
+    for h in range(horizons + 1):
+        tmp = lp.copy()
+        tmp[f"UA_lead_{h}"] = tmp["UA"].shift(-h)
+        sample = tmp.dropna(subset=[f"UA_lead_{h}"] + design_cols)
+        X = add_constant(sample[design_cols], has_constant="add")
+        y = sample[f"UA_lead_{h}"]
+        res = OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 12})
+        beta_fx.append(res.params["FX_DEPR"])
+        beta_fx_state.append(res.params["FX_STATE"])
+        beta_policy.append(res.params["POLICY_SHOCK"])
+        beta_policy_state.append(res.params["POLICY_STATE"])
+
+    removed_fx = pd.Series(0.0, index=df.index, name="LP_removed_fx")
+    removed_policy = pd.Series(0.0, index=df.index, name="LP_removed_policy")
+    for h in range(horizons + 1):
+        fx_term = (beta_fx[h] * df["FX_DEPR"] + beta_fx_state[h] * df["FX_DEPR"] * df["fx_channel_weight"]).shift(h)
+        pol_term = (beta_policy[h] * df["POLICY_SHOCK"] + beta_policy_state[h] * df["POLICY_SHOCK"] * df["policy_channel_weight"]).shift(h)
+        removed_fx = removed_fx.add(fx_term, fill_value=0.0)
+        removed_policy = removed_policy.add(pol_term, fill_value=0.0)
+
+    cf = df["UA"] - removed_fx - removed_policy - credibility_shift
+    cf.name = "CF_local_projections"
+    return cf, removed_fx, removed_policy
+
+
+def svar_counterfactual(df: pd.DataFrame, credibility_shift: pd.Series, maxlags: int = 3, ma_horizon: int = 24):
+    var_cols = ["EA_FACTOR", "BRENT_YOY", "UA_IP_GAP", "FX_DEPR", "POLICY_SHOCK", "UA"]
+    sample = df[var_cols].dropna().copy()
+    model = VAR(sample)
+    selected = model.select_order(maxlags=maxlags).selected_orders["bic"]
+    lag_order = max(1, selected or 1)
+    res = model.fit(lag_order)
+
+    sigma = res.sigma_u.to_numpy()
+    chol = np.linalg.cholesky(sigma)
+    residuals = res.resid.to_numpy()
+    effective_index = res.resid.index
+    sample_eff = sample.loc[effective_index]
+    shocks = np.linalg.solve(chol, residuals.T).T
+
+    ma = res.ma_rep(ma_horizon)
+    structural_irf = np.array([ma_h @ chol for ma_h in ma])
+
+    idx_ua = var_cols.index("UA")
+    idx_fx = var_cols.index("FX_DEPR")
+    idx_policy = var_cols.index("POLICY_SHOCK")
+
+    fx_weight = df.loc[effective_index, "fx_channel_weight"].to_numpy()
+    policy_weight = df.loc[effective_index, "policy_channel_weight"].to_numpy()
+
+    removed_fx = np.zeros(len(sample_eff))
+    removed_policy = np.zeros(len(sample_eff))
+
+    for t in range(len(sample_eff)):
+        for h in range(min(ma_horizon, t) + 1):
+            source = t - h
+            removed_fx[t] += structural_irf[h, idx_ua, idx_fx] * shocks[source, idx_fx] * fx_weight[source]
+            removed_policy[t] += structural_irf[h, idx_ua, idx_policy] * shocks[source, idx_policy] * policy_weight[source]
+
+    removed_fx = pd.Series(removed_fx, index=effective_index, name="SVAR_removed_fx")
+    removed_policy = pd.Series(removed_policy, index=effective_index, name="SVAR_removed_policy")
+    cf = sample_eff["UA"] - removed_fx - removed_policy - credibility_shift.reindex(effective_index)
+    cf.name = "CF_svar"
+    return cf, removed_fx, removed_policy, res
+
+
+def augmented_synthetic_control(df: pd.DataFrame, donor_panel: pd.DataFrame):
+    donors = donor_panel.copy().sort_index()
+    donors = donors.loc[:, donors.notna().mean() >= 0.95]
+    common_idx = df.index.intersection(donors.index)
+    donors = donors.reindex(common_idx)
+    target = df.reindex(common_idx)["UA"]
+
+    calibration_mask = (
+        target.notna()
+        & donors.notna().all(axis=1)
+        & (
+            ((common_idx >= pd.Timestamp("2001-01-01")) & (common_idx <= pd.Timestamp("2008-08-01")))
+            | ((common_idx >= pd.Timestamp("2010-01-01")) & (common_idx <= pd.Timestamp("2014-01-01")))
+            | ((common_idx >= pd.Timestamp("2016-01-01")) & (common_idx <= pd.Timestamp("2021-12-01")))
+        )
+    )
+
+    X = donors.loc[calibration_mask].to_numpy(dtype=float)
+    y = target.loc[calibration_mask].to_numpy(dtype=float)
+    n_donors = X.shape[1]
+    ridge = 1e-4
+
+    def objective(w):
+        resid = y - X @ w
+        return np.mean(resid ** 2) + ridge * np.sum(w ** 2)
+
+    cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    bounds = [(0.0, 1.0)] * n_donors
+    w0 = np.repeat(1.0 / n_donors, n_donors)
+    opt = minimize(objective, w0, bounds=bounds, constraints=cons, method="SLSQP")
+    weights = pd.Series(opt.x, index=donors.columns, name="weight")
+
+    cf = donors @ weights
+    cf.name = "CF_augmented_synthetic_control"
+    return cf, weights.sort_values(ascending=False)
+
+
+def median_counterfactual(series_list: list[pd.Series]) -> pd.Series:
+    stacked = pd.concat(series_list, axis=1)
+    median = stacked.median(axis=1)
+    median.name = "CF_main"
+    return median
+
+
 panel = pd.read_csv(os.path.join(DATA_DIR, "data_clean_panel.csv"), index_col=0, parse_dates=True)
 panel.index.name = "date"
+macro = pd.read_csv(os.path.join(DATA_DIR, "data_external_macro.csv"), index_col=0, parse_dates=True)
+macro.index.name = "date"
+donor_panel = pd.read_csv(os.path.join(DATA_DIR, "data_extended_hicp_panel.csv"), index_col=0, parse_dates=True)
+donor_panel.index.name = "date"
+
 EA_COLS = [c for c in panel.columns if c != "UA"]
 ua = panel["UA"].copy()
 ea = panel[EA_COLS].copy()
 
-print("=" * 70)
-print("PART B: COUNTERFACTUAL INFLATION ANALYSIS (REFINED)")
-print("=" * 70)
-print(f"Panel: {panel.shape[0]} months, {len(EA_COLS)} EA countries + Ukraine")
+ea_factor, eigenvalues, explained_ratio = compute_ea_factor(ea)
+regimes = build_regime_map(panel.index)
+
+analysis = panel.join(ea_factor, how="left").join(macro, how="left").join(regimes, how="left")
+analysis["EA_MEAN"] = ea.mean(axis=1)
+analysis["UA_IP_GAP"] = analysis["UA_IP_YOY"] - 100.0
+analysis["POLICY_SHOCK"] = analysis["POLICY_SPREAD_CHG"].fillna(0.0)
+
+anchor, credibility_premium, credibility_shift = estimate_credibility_shift(analysis, regimes)
+analysis["FACTOR_ANCHOR"] = anchor
+analysis["credibility_shift"] = credibility_shift
+
+cf_factor, factor_model = factor_benchmark(analysis, credibility_shift)
+cf_lp, lp_removed_fx, lp_removed_policy = local_projection_counterfactual(analysis, credibility_shift)
+cf_svar, svar_removed_fx, svar_removed_policy, svar_model = svar_counterfactual(analysis, credibility_shift)
+cf_ascm, donor_weights = augmented_synthetic_control(analysis, donor_panel)
+cf_main = median_counterfactual([cf_lp, cf_svar, cf_ascm])
+
+decomp_fx = pd.concat([lp_removed_fx.rename("lp"), svar_removed_fx.rename("svar")], axis=1).mean(axis=1).rename("FX_removed")
+decomp_policy = pd.concat([lp_removed_policy.rename("lp"), svar_removed_policy.rename("svar")], axis=1).mean(axis=1).rename("Policy_removed")
+decomp_cred = credibility_shift.rename("Credibility_import")
+
+
+print("=" * 72)
+print("PART B: MULTI-METHOD COUNTERFACTUAL ANALYSIS")
+print("=" * 72)
+print(f"Base panel: {panel.shape[0]} months, {len(EA_COLS)} EA countries + Ukraine")
+print(f"Expanded donor pool: {donor_panel.shape[1]} countries")
 print(f"Period: {panel.index.min():%Y-%m} to {panel.index.max():%Y-%m}")
 
+print(f"\nEA factor benchmark:")
+print(f"  PC1 explains {explained_ratio[0]:.1%} of EA inflation variance")
+print(f"  Corr(EA factor, EA mean) = {ea_factor.corr(analysis['EA_MEAN']):.4f}")
+print(f"  Credibility premium estimated on stable pre-IT periods = {credibility_premium:.2f} pp")
 
-# =====================================================================
-# 1. STATIONARITY TESTS
-# =====================================================================
-print(f"\n{'─'*70}")
-print("1. ADF UNIT ROOT TESTS (H0: unit root)")
-print(f"{'─'*70}")
+print("\nExplicit regime mapping from Part A:")
+for regime_name, sub in regimes.groupby("regime"):
+    print(
+        f"  {regime_name:<22s}"
+        f" FX={sub['fx_channel_weight'].iloc[0]:.2f}"
+        f" Policy={sub['policy_channel_weight'].iloc[0]:.2f}"
+        f" Cred={sub['credibility_gain_weight'].iloc[0]:.2f}"
+    )
 
-adf_results = {}
-for col in panel.columns:
-    s = panel[col].dropna()
-    if len(s) > 20:
-        stat, pval, lags, nobs, crit, _ = adfuller(s, maxlag=12, autolag="AIC")
-        adf_results[col] = {"ADF_stat": round(stat, 3), "p_value": round(pval, 3),
-                            "lags": lags, "stationary_5pct": pval < 0.05}
-adf_df = pd.DataFrame(adf_results).T
-print(adf_df.to_string())
-n_stat = adf_df["stationary_5pct"].sum()
-print(f"\n{n_stat}/{len(adf_df)} series reject H0 at 5%.")
-print("Inflation is typically I(0) or near-I(0); we proceed in levels.")
+print("\nSVAR summary:")
+print(f"  Variables: EA factor, Brent YoY, UA industry gap, FX depreciation, policy-spread shock, UA inflation")
+print(f"  Selected lag order (BIC): {svar_model.k_ar}")
 
-
-# =====================================================================
-# 2. COMMON FACTOR EXTRACTION + SCREE ANALYSIS
-# =====================================================================
-print(f"\n{'─'*70}")
-print("2. COMMON FACTOR EXTRACTION (PCA) + COMPONENT SELECTION")
-print(f"{'─'*70}")
-
-ea_clean = ea.dropna()
-ea_mean_vec = ea_clean.mean()
-ea_std_vec = ea_clean.std()
-ea_z = (ea_clean - ea_mean_vec) / ea_std_vec
-
-# Fit all components for scree analysis
-eigenvalues, var_explained, pca_scores = fit_pca_standardized(ea_z)
-
-print("Component selection criteria:")
-print(f"  {'PC':>4s} {'Eigenvalue':>12s} {'% Var':>8s} {'Cumul %':>9s} {'Kaiser':>8s}")
-for i in range(min(6, len(EA_COLS))):
-    cum = sum(var_explained[:i+1])
-    kaiser = "KEEP" if eigenvalues[i] > 1.0 else "DROP"
-    print(f"  PC{i+1:>2d} {eigenvalues[i]:12.3f} {var_explained[i]:7.1%} "
-          f"{cum:8.1%} {kaiser:>8s}")
-
-# Kaiser criterion: keep components with eigenvalue > 1
-n_kaiser = sum(eigenvalues > 1.0)
-print(f"\nKaiser criterion: retain {n_kaiser} component(s) (eigenvalue > 1)")
-print(f"PC1 alone explains {var_explained[0]:.1%} — dominant common factor.")
-print("Decision: retain 1 component (standard in Ciccarelli-Mojon framework).")
-
-# Scree plot
-fig_scree, ax_scree = plt.subplots(figsize=(8, 5))
-ax_scree.bar(range(1, len(EA_COLS)+1), eigenvalues, color="steelblue",
-             edgecolor="white", alpha=0.8, label="Eigenvalue")
-ax_scree.axhline(1.0, color="red", linestyle="--", linewidth=1.5,
-                  label="Kaiser criterion (eigenvalue = 1)")
-ax_scree.plot(range(1, len(EA_COLS)+1), eigenvalues, "o-", color="darkblue",
-              markersize=6)
-ax_scree.set_xlabel("Principal Component")
-ax_scree.set_ylabel("Eigenvalue")
-ax_scree.set_title("Scree Plot: PCA on 11 EA Country Inflation Series")
-ax_scree.set_xticks(range(1, len(EA_COLS)+1))
-ax_scree.legend()
-ax_scree.grid(True, alpha=0.3, axis="y")
-fig_scree.tight_layout()
-fig_scree.savefig(os.path.join(FIG_DIR, "fig_scree_plot.png"), dpi=150)
-print("Saved: fig_scree_plot.png")
-
-# Extract PC1 and scale to EA-average inflation units
-F_EA_raw = pd.Series(pca_scores[:, 0], index=ea_clean.index)
-ea_avg = ea_clean.mean(axis=1)
-F_EA = (F_EA_raw - F_EA_raw.mean()) / F_EA_raw.std() * ea_avg.std() + ea_avg.mean()
-F_EA.name = "F_EA"
-print(f"Corr(F_EA, EA simple average): {F_EA.corr(ea_avg):.4f}")
-
-
-# =====================================================================
-# 3. STRUCTURAL BREAK TESTS (Bai-Perron style via sequential Chow tests)
-# =====================================================================
-print(f"\n{'─'*70}")
-print("3. STRUCTURAL BREAK DETECTION ON UKRAINE INFLATION")
-print(f"{'─'*70}")
-
-def rolling_chow_test(y, window=60, step=6):
-    """
-    Sequential Chow-type F-tests for structural breaks.
-    Tests whether parameters of a simple AR(1) model change at each candidate date.
-    Returns a Series of F-statistics indexed by break date.
-    """
-    n = len(y)
-    f_stats = {}
-    for i in range(window, n - window, step):
-        y1 = y.iloc[:i]
-        y2 = y.iloc[i:]
-        # Full model (pooled)
-        X_full = add_constant(y.shift(1).iloc[1:])
-        y_full = y.iloc[1:]
-        mask = X_full.notna().all(axis=1) & y_full.notna()
-        ssr_full = OLS(y_full[mask], X_full[mask]).fit().ssr
-        # Split models
-        X1 = add_constant(y1.shift(1).iloc[1:])
-        y1r = y1.iloc[1:]
-        m1 = X1.notna().all(axis=1) & y1r.notna()
-        X2 = add_constant(y2.shift(1).iloc[1:])
-        y2r = y2.iloc[1:]
-        m2 = X2.notna().all(axis=1) & y2r.notna()
-        if m1.sum() < 5 or m2.sum() < 5:
-            continue
-        ssr1 = OLS(y1r[m1], X1[m1]).fit().ssr
-        ssr2 = OLS(y2r[m2], X2[m2]).fit().ssr
-        ssr_split = ssr1 + ssr2
-        k = 2  # number of parameters
-        n_obs = m1.sum() + m2.sum()
-        if ssr_split > 0:
-            f_stat = ((ssr_full - ssr_split) / k) / (ssr_split / (n_obs - 2*k))
-            f_stats[y.index[i]] = f_stat
-    return pd.Series(f_stats)
-
-ua_clean = ua.dropna()
-chow_stats = rolling_chow_test(ua_clean, window=36, step=3)
-
-# Identify significant breaks (F > critical value ~3.0 for 5% with k=2)
-F_CRIT = 3.0
-breaks = chow_stats[chow_stats > F_CRIT]
-# Cluster nearby breaks (keep the peak within 12-month windows)
-break_dates = []
-if len(breaks) > 0:
-    sorted_breaks = breaks.sort_values(ascending=False)
-    used = set()
-    for dt, fval in sorted_breaks.items():
-        if not any(abs((dt - u).days) < 365 for u in used):
-            break_dates.append((dt, fval))
-            used.add(dt)
-            if len(break_dates) >= 6:
-                break
-
-break_dates.sort(key=lambda x: x[0])
-print("Detected structural breaks (sequential Chow test, F > 3.0):")
-for dt, fval in break_dates:
-    print(f"  {dt:%Y-%m}: F = {fval:.1f}")
-
-# Define "quiet" periods as intervals BETWEEN breaks where F-stats are low
-# This endogenises the calibration window selection
-quiet_mask = chow_stats.reindex(ua_clean.index, method="nearest") < F_CRIT * 0.5
-# Expand to full panel index
-quiet_full = pd.Series(False, index=panel.index)
-for dt in quiet_mask[quiet_mask].index:
-    if dt in quiet_full.index:
-        quiet_full.loc[dt] = True
-
-# Also exclude the first 12 months (YoY computation warm-up)
-quiet_full.loc[:"2001-01"] = False
-
-n_quiet = quiet_full.sum()
-print(f"\nData-driven quiet periods: {n_quiet} months "
-      f"(out of {len(quiet_full)} total)")
-print("(Months where Chow F-statistic < 1.5, indicating regime stability)")
-
-
-# =====================================================================
-# 4. COUNTRY-LEVEL FACTOR LOADINGS + AUTOMATIC HAC
-# =====================================================================
-print(f"\n{'─'*70}")
-print("4. COUNTRY-LEVEL FACTOR LOADINGS (OLS, Andrews auto-HAC)")
-print(f"{'─'*70}")
-
-def estimate_loading(y, X, maxlags="auto"):
-    """Estimate loading with Andrews automatic bandwidth HAC."""
-    if maxlags == "auto":
-        # Andrews (1991) rule of thumb: floor(4*(T/100)^(2/9))
-        T = len(y)
-        auto_lags = int(np.floor(4 * (T / 100) ** (2/9)))
-        auto_lags = max(1, min(auto_lags, T // 4))
-    else:
-        auto_lags = maxlags
-    res = OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": auto_lags})
-    return res, auto_lags
-
-T = len(ea_clean)
-auto_lag = int(np.floor(4 * (T / 100) ** (2/9)))
-print(f"Andrews automatic HAC bandwidth: {auto_lag} lags "
-      f"(T={T}, formula: floor(4*(T/100)^(2/9)))")
-print()
-
-print(f"{'Country':>8s} {'alpha':>8s} {'lambda':>8s} {'R²':>6s} {'se(λ)':>7s}")
-print("─" * 40)
-
-loadings = {}
-for col in EA_COLS:
-    y = ea_clean[col]
-    X = add_constant(F_EA.reindex(y.index))
-    res, _ = estimate_loading(y, X)
-    loadings[col] = {
-        "alpha": res.params["const"],
-        "lambda": res.params["F_EA"],
-        "R2": res.rsquared,
-        "se_lambda": res.bse["F_EA"],
-    }
-    print(f"{col:>8s} {res.params['const']:8.3f} {res.params['F_EA']:8.3f} "
-          f"{res.rsquared:6.3f} {res.bse['F_EA']:7.3f}")
-
-load_df = pd.DataFrame(loadings).T
-
-# ── Sensitivity: Three groupings ──
-PERIPHERY = ["GR", "IE", "PT", "ES", "FI"]
-CORE = [c for c in EA_COLS if c not in PERIPHERY]
-
-groupings = {
-    "Periphery (GR,IE,PT,ES,FI)": PERIPHERY,
-    "Core (AT,BE,DE,FR,IT,NL)": CORE,
-    "All EA-11": EA_COLS,
-}
-
-print(f"\n{'─'*70}")
-print("5. SENSITIVITY: COUNTERFACTUAL UNDER DIFFERENT GROUPINGS")
-print(f"{'─'*70}")
-print(f"{'Grouping':<30s} {'alpha':>8s} {'lambda':>8s}")
-print("─" * 48)
-
-cf_variants_grouping = {}
-for gname, gcols in groupings.items():
-    a = load_df.loc[gcols, "alpha"].mean()
-    l = load_df.loc[gcols, "lambda"].mean()
-    print(f"{gname:<30s} {a:8.3f} {l:8.3f}")
-    cf_variants_grouping[gname] = a + l * F_EA
-
-# Primary grouping
-alpha_p = load_df.loc[PERIPHERY, "alpha"].mean()
-lambda_p = load_df.loc[PERIPHERY, "lambda"].mean()
-cf_pure = alpha_p + lambda_p * F_EA
-cf_pure.name = "CF_factor"
-
-
-# =====================================================================
-# 6. STRUCTURAL PREMIUM + EMPIRICAL CREDIBILITY PROXY
-# =====================================================================
-print(f"\n{'─'*70}")
-print("6. STRUCTURAL PREMIUM + EMPIRICAL CREDIBILITY PROXY")
-print(f"{'─'*70}")
-
-# Structural premium: median gap between UA and factor in quiet periods
-ua_quiet = ua[quiet_full].dropna()
-factor_quiet = F_EA.reindex(ua_quiet.index)
-both_valid = ua_quiet.index.intersection(factor_quiet.dropna().index)
-structural_premium = (ua_quiet.loc[both_valid] - factor_quiet.loc[both_valid]).median()
-print(f"Structural premium (median, data-driven quiet periods): "
-      f"{structural_premium:.1f} pp")
-
-# ── Empirical credibility proxy ──
-# Idea: credibility ∝ how close Ukraine's inflation is to its target/anchor.
-# Under the dollar peg: anchor = imported via FX stability
-# Under IT (post-2016): anchor = 5% target
-# We measure: rolling 24-month std of Ukraine's inflation as a proxy for
-# "how anchored" expectations are.  Lower volatility = higher credibility.
-# Then: credibility_discount = normalised inverse of rolling volatility.
-
-rolling_vol = ua.rolling(24, min_periods=12).std()
-# Normalise to [0, 1]: 0 = max volatility (no credibility), 1 = min vol (full cred.)
-vol_max = rolling_vol.quantile(0.95)
-vol_min = rolling_vol.quantile(0.05)
-cred_empirical = 1 - (rolling_vol - vol_min) / (vol_max - vol_min)
-cred_empirical = cred_empirical.clip(0, 1)
-
-# Under EA membership, the premium is reduced by the credibility gain.
-# cred_discount: how much of the premium is KEPT (not eliminated)
-# = 1 - cred_empirical means: when Ukraine is already credible (high cred_empirical),
-#   the euro adds little → keep most of the premium.
-# When Ukraine is not credible (low cred_empirical), the euro adds a lot
-#   → eliminate most of the premium.
-# But we invert the logic: the euro ALWAYS gives credibility, so the discount
-# on the premium should reflect how much ADDITIONAL credibility the euro provides.
-# Additional credibility ∝ (1 - existing credibility)
-# premium_kept = existing_credibility (already earned by NBU)
-# premium_eliminated = 1 - existing_credibility (imported from ECB)
-cred_discount = cred_empirical  # fraction of premium KEPT
-# During extreme volatility (crisis), existing credibility ≈ 0 → premium mostly eliminated
-# During stable IT period, existing credibility ≈ 0.7-0.9 → premium mostly kept
-
-print(f"Credibility proxy (rolling 24m vol, normalised):")
-for period, s, e in [
-    ("Dollar peg 2002-07", "2002-01", "2007-12"),
-    ("GFC 2008-09", "2008-09", "2009-06"),
-    ("Re-peg 2010-13", "2010-01", "2013-12"),
-    ("Crimea 2014-15", "2014-02", "2015-12"),
-    ("IT period 2017-21", "2017-01", "2021-12"),
-    ("Invasion 2022-23", "2022-02", "2023-12"),
+print("\nCounterfactual gaps in key episodes:")
+for label, start, end in [
+    ("GFC", "2008-09-01", "2009-06-01"),
+    ("Crimea/Donbas", "2014-02-01", "2015-12-01"),
+    ("Inflation targeting", "2017-01-01", "2021-12-01"),
+    ("Full-scale invasion", "2022-02-01", "2023-06-01"),
 ]:
-    avg = cred_discount.loc[s:e].mean()
-    print(f"  {period:<25s}: cred_discount = {avg:.2f} "
-          f"(premium kept = {avg*100:.0f}%)")
+    actual = analysis["UA"].loc[start:end].mean()
+    main = cf_main.loc[start:end].mean()
+    lp_gap = (analysis["UA"] - cf_lp).loc[start:end].mean()
+    svar_gap = (analysis["UA"] - cf_svar).loc[start:end].mean()
+    print(
+        f"  {label:<18s} actual={actual:6.2f}%"
+        f" main_cf={main:6.2f}%"
+        f" lp_gap={lp_gap:+6.2f} pp"
+        f" svar_gap={svar_gap:+6.2f} pp"
+    )
 
-# Credibility-adjusted counterfactual
-adjusted_premium = structural_premium * cred_discount
-cf_credibility = cf_pure + adjusted_premium
-cf_credibility.name = "CF_credibility"
-
-
-# =====================================================================
-# 7. DATA-DRIVEN TREATMENT INTENSITY
-# =====================================================================
-print(f"\n{'─'*70}")
-print("7. DATA-DRIVEN TREATMENT INTENSITY")
-print(f"{'─'*70}")
-
-# Treatment intensity: how much would euro membership change things?
-# We measure this by the DIVERGENCE between Ukraine's inflation dynamics
-# and the EA common factor — specifically, rolling absolute gap.
-#
-# Logic: when the gap is large (Ukraine diverging from EA), euro membership
-# would have made a big difference → high treatment.
-# When gap is small (Ukraine tracking EA), euro wouldn't change much → low treatment.
-#
-# We also incorporate exchange-rate volatility: when the hryvnia is volatile,
-# euro membership eliminates the FX channel → high treatment.
-
-# Component 1: Rolling absolute gap (UA vs factor)
-rolling_gap = (ua - F_EA).abs().rolling(12, min_periods=6).mean()
-
-# Component 2: Rolling FX-implied volatility proxy
-# Since we don't have UAH/USD in this dataset, we use the gap between
-# Ukraine's inflation and its own 24-month trailing mean as a proxy
-# for FX-driven shocks (devaluations cause sharp inflation spikes).
-ua_deviation = (ua - ua.rolling(24, min_periods=12).mean()).abs()
-ua_deviation_norm = ua_deviation / ua_deviation.quantile(0.95)
-ua_deviation_norm = ua_deviation_norm.clip(0, 1)
-
-# Combine: treatment = weighted average of gap-based and volatility-based
-gap_norm = rolling_gap / rolling_gap.quantile(0.95)
-gap_norm = gap_norm.clip(0, 1)
-
-treatment = (0.6 * gap_norm + 0.4 * ua_deviation_norm).clip(0, 1)
-treatment.name = "treatment"
-
-print("Treatment intensity (data-driven, 0=low, 1=high):")
-for period, s, e in [
-    ("Dollar peg 2002-07", "2002-01", "2007-12"),
-    ("Pre-GFC boom 2007-08", "2007-01", "2008-08"),
-    ("GFC crisis 2008-09", "2008-09", "2009-06"),
-    ("Re-peg 2010-13", "2010-01", "2013-12"),
-    ("Crimea/Donbas 2014-15", "2014-02", "2015-12"),
-    ("IT period 2017-21", "2017-01", "2021-12"),
-    ("Invasion 2022-23", "2022-02", "2023-12"),
-]:
-    avg = treatment.loc[s:e].mean()
-    print(f"  {period:<25s}: {avg:.2f}")
+print("\nTop augmented-synthetic-control donor weights:")
+print(donor_weights.head(10).round(4).to_string())
 
 
-# =====================================================================
-# 8. FINAL COUNTERFACTUAL + REGIME-AWARE BLENDING
-# =====================================================================
-print(f"\n{'─'*70}")
-print("8. FINAL COUNTERFACTUAL CONSTRUCTION")
-print(f"{'─'*70}")
-
-# CF_final = treatment × CF_credibility + (1 - treatment) × UA_actual
-cf_final = (treatment * cf_credibility + (1 - treatment) * ua).dropna()
-cf_final.name = "CF_final"
-
-ea_simple_avg = ea.mean(axis=1)
-
-print(f"CF_pure:        periphery loading × common factor")
-print(f"CF_credibility: + empirical credibility-adjusted premium")
-print(f"CF_final:       + data-driven regime blending (MAIN RESULT)")
-
-
-# =====================================================================
-# 9. BOOTSTRAP CONFIDENCE INTERVALS
-# =====================================================================
-print(f"\n{'─'*70}")
-print("9. BOOTSTRAP CONFIDENCE INTERVALS (B=500)")
-print(f"{'─'*70}")
-
-B = 500  # number of bootstrap replications
-cf_boot = np.full((B, len(F_EA)), np.nan)
-
-for b in range(B):
-    # Resample EA countries (block bootstrap at country level)
-    boot_cols = np.random.choice(EA_COLS, size=len(EA_COLS), replace=True)
-    ea_boot = ea_clean[boot_cols].copy()
-    ea_boot.columns = [f"c{i}" for i in range(len(boot_cols))]
-
-    # Re-standardise and extract PC1
-    ea_b_z = (ea_boot - ea_boot.mean()) / ea_boot.std()
-    _, _, scores_b = fit_pca_standardized(ea_b_z)
-    f_b_raw = pd.Series(scores_b[:, 0], index=ea_clean.index)
-    ea_avg_b = ea_boot.mean(axis=1)
-    f_b = (f_b_raw - f_b_raw.mean()) / f_b_raw.std() * ea_avg_b.std() + ea_avg_b.mean()
-
-    # Re-estimate periphery loadings on the resampled factor
-    # (using actual peripheral countries, not resampled ones)
-    alphas_b, lambdas_b = [], []
-    for pc in PERIPHERY:
-        y_pc = ea_clean[pc]
-        X_pc = add_constant(f_b.reindex(y_pc.index).rename("F"))
-        try:
-            r = OLS(y_pc, X_pc).fit()
-            alphas_b.append(r.params["const"])
-            lambdas_b.append(r.params["F"])
-        except:
-            pass
-
-    if len(alphas_b) > 0:
-        a_b = np.mean(alphas_b)
-        l_b = np.mean(lambdas_b)
-        cf_b = a_b + l_b * f_b
-        # Add credibility-adjusted premium (using same empirical cred_discount)
-        cf_b_adj = cf_b + structural_premium * cred_discount.reindex(cf_b.index, fill_value=0.5)
-        # Regime-aware blend
-        t_aligned = treatment.reindex(cf_b_adj.index, fill_value=0.5)
-        ua_aligned = ua.reindex(cf_b_adj.index)
-        cf_b_final = t_aligned * cf_b_adj + (1 - t_aligned) * ua_aligned
-        cf_boot[b, :] = cf_b_final.values
-
-# Compute percentiles
-cf_lo = np.nanpercentile(cf_boot, 5, axis=0)
-cf_hi = np.nanpercentile(cf_boot, 95, axis=0)
-cf_lo_series = pd.Series(cf_lo, index=F_EA.index, name="CF_lo_5")
-cf_hi_series = pd.Series(cf_hi, index=F_EA.index, name="CF_hi_95")
-
-print(f"Bootstrap: {B} replications (country-level block resampling)")
-print(f"90% CI computed (5th and 95th percentiles)")
-
-# Also bootstrap the crisis gaps
-gap_boot = {}
-for name, s, e in [
-    ("GFC", "2008-09", "2009-06"),
-    ("Crimea", "2014-02", "2015-12"),
-    ("Invasion", "2022-02", "2023-06"),
-]:
-    idx_s = F_EA.index.searchsorted(pd.Timestamp(s))
-    idx_e = F_EA.index.searchsorted(pd.Timestamp(e))
-    ua_slice = ua.loc[s:e].mean()
-    boot_gaps = ua_slice - np.nanmean(cf_boot[:, idx_s:idx_e+1], axis=1)
-    lo, med, hi = np.nanpercentile(boot_gaps, [5, 50, 95])
-    gap_boot[name] = (lo, med, hi)
-    print(f"  {name} gap: {med:+.1f} pp (90% CI: [{lo:+.1f}, {hi:+.1f}])")
-
-
-# =====================================================================
-# 10. SANITY CHECKS
-# =====================================================================
-print(f"\n{'─'*70}")
-print("10. SANITY CHECKS")
-print(f"{'─'*70}")
-
-for name, s, e in [
-    ("GFC 2008-09", "2008-09", "2009-06"),
-    ("Crimea 2014-15", "2014-02", "2015-12"),
-    ("Invasion 2022", "2022-02", "2023-06"),
-    ("IT period 2017-21", "2017-01", "2021-12"),
-]:
-    a = ua.loc[s:e].mean()
-    c = cf_final.loc[s:e].mean()
-    if not np.isnan(c):
-        print(f"  {name:20s}: actual={a:5.1f}%, CF={c:5.1f}%, gap={a-c:+6.1f} pp")
-
-# Pre vs post 2016 gap
-gap_pre = (ua.loc["2001":"2015"] - cf_final.reindex(ua.loc["2001":"2015"].index)).dropna()
-gap_post = (ua.loc["2016":"2021"] - cf_final.reindex(ua.loc["2016":"2021"].index)).dropna()
-if len(gap_pre) > 0 and len(gap_post) > 0:
-    print(f"\n  Avg gap pre-2016:  {gap_pre.mean():+.1f} pp")
-    print(f"  Avg gap post-2016: {gap_post.mean():+.1f} pp")
-    check = abs(gap_pre.mean()) > abs(gap_post.mean())
-    print(f"  {'PASS' if check else 'REVIEW'}: Pre-2016 gap "
-          f"{'>' if check else '<='} post-2016")
-
-corr_check = cf_final.corr(ea_simple_avg.reindex(cf_final.index))
-print(f"\n  Corr(CF_final, EA simple mean): {corr_check:.3f}")
-print(f"  CF distinct from EA mean: {'YES' if abs(corr_check) < 0.99 else 'REVIEW'}")
-
-
-# =====================================================================
-# 11. FIGURES
-# =====================================================================
-print(f"\n{'─'*70}")
-print("11. PRODUCING FIGURES")
-print(f"{'─'*70}")
-
-# ── MAIN FIGURE (Deliverable 1) ──
+# ---------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------
 fig = plt.figure(figsize=(14, 12))
-gs = GridSpec(3, 1, height_ratios=[3, 1, 1], hspace=0.08, figure=fig)
+gs = GridSpec(3, 1, height_ratios=[3, 1.2, 1], hspace=0.08, figure=fig)
 ax1 = fig.add_subplot(gs[0])
 ax2 = fig.add_subplot(gs[1], sharex=ax1)
 ax3 = fig.add_subplot(gs[2], sharex=ax1)
 
-# Top: Actual vs Counterfactual with bootstrap CI
-for col in EA_COLS:
-    ax1.plot(ea.index, ea[col], color="lightgrey", linewidth=0.4, alpha=0.4)
-ax1.plot(ea.index, ea_simple_avg, color="steelblue", linewidth=1.0,
-         linestyle="--", alpha=0.6, label="EA-11 average")
-
-# Bootstrap CI band
-ax1.fill_between(F_EA.index, cf_lo_series, cf_hi_series,
-                  color="green", alpha=0.15, label="90% bootstrap CI")
-ax1.plot(ua.index, ua, color="red", linewidth=2.0, label="Ukraine (actual)")
-ax1.plot(cf_final.index, cf_final, color="darkgreen", linewidth=2.0,
-         label="Counterfactual (Ukraine in EA)")
-
+ax1.plot(analysis.index, analysis["UA"], color="red", linewidth=2.2, label="Ukraine (actual)")
+ax1.plot(cf_main.index, cf_main, color="darkgreen", linewidth=2.0, label="Counterfactual (main median)")
+ax1.plot(cf_lp.index, cf_lp, color="teal", linewidth=1.1, alpha=0.85, label="Local projections")
+ax1.plot(cf_svar.index, cf_svar, color="navy", linewidth=1.1, alpha=0.85, label="SVAR")
+ax1.plot(cf_ascm.index, cf_ascm, color="darkorange", linewidth=1.1, alpha=0.85, label="Augmented synthetic control")
+ax1.plot(cf_factor.index, cf_factor, color="grey", linewidth=1.0, linestyle="--", alpha=0.9, label="Factor benchmark")
+ax1.axhline(0, color="black", linewidth=0.5, linestyle=":")
 for s, e, lbl, clr in [
     ("2008-09-01", "2009-06-01", "GFC", "orange"),
     ("2014-02-01", "2015-12-01", "Crimea/\nDonbas", "purple"),
@@ -603,182 +391,95 @@ for s, e, lbl, clr in [
 ]:
     ax1.axvspan(pd.Timestamp(s), pd.Timestamp(e), alpha=0.07, color=clr)
     mid = pd.Timestamp(s) + (pd.Timestamp(e) - pd.Timestamp(s)) / 2
-    ax1.text(mid, 62, lbl, ha="center", va="top", fontsize=8,
-             color=clr, fontweight="bold", alpha=0.7)
-
-ax1.axhline(0, color="black", linewidth=0.5, linestyle=":")
-ax1.set_ylabel("Year-on-year inflation (%)", fontsize=11)
-ax1.set_title("Counterfactual: What If Ukraine Had Been in the Euro Area?",
-              fontsize=14, fontweight="bold")
-ax1.legend(loc="upper left", fontsize=8, frameon=True, fancybox=True, ncol=2)
+    ax1.text(mid, 61, lbl, ha="center", va="top", fontsize=8, color=clr, fontweight="bold", alpha=0.75)
+ax1.set_ylabel("Year-on-year inflation (%)")
+ax1.set_title("Ukraine Counterfactual Under Euro-Area Membership: Structural Core + Benchmarks")
+ax1.legend(loc="upper left", ncol=2, fontsize=8, frameon=True)
 ax1.grid(True, alpha=0.2)
 ax1.set_ylim(-5, 65)
 plt.setp(ax1.get_xticklabels(), visible=False)
 
-# Middle: Gap
-gap = (ua - cf_final).dropna()
-ax2.fill_between(gap.index, 0, gap, where=gap > 0,
-                  color="red", alpha=0.3, label="Higher inflation (cost)")
-ax2.fill_between(gap.index, 0, gap, where=gap < 0,
-                  color="green", alpha=0.3, label="Lower inflation (benefit)")
-ax2.plot(gap.index, gap, color="black", linewidth=0.7)
+ax2.fill_between(analysis.index, 0, decomp_fx, color="orange", alpha=0.35, label="FX channel removed")
+ax2.fill_between(analysis.index, 0, decomp_policy, color="steelblue", alpha=0.35, label="Policy harmonization")
+ax2.fill_between(analysis.index, 0, -decomp_cred, color="purple", alpha=0.15, label="Credibility import")
+ax2.plot((analysis["UA"] - cf_main).index, (analysis["UA"] - cf_main), color="black", linewidth=1.0, label="Actual - main CF")
 ax2.axhline(0, color="black", linewidth=0.5)
-ax2.set_ylabel("Actual − CF (pp)", fontsize=10)
-ax2.legend(loc="upper left", fontsize=7, frameon=True, ncol=2)
+ax2.set_ylabel("Gap / contribution")
+ax2.legend(loc="upper left", ncol=2, fontsize=8, frameon=True)
 ax2.grid(True, alpha=0.2)
 plt.setp(ax2.get_xticklabels(), visible=False)
 
-# Bottom: Treatment intensity + credibility
-ax3.fill_between(treatment.index, 0, treatment, color="orange", alpha=0.3,
-                  label="Treatment intensity")
-ax3.plot(treatment.index, treatment, color="darkorange", linewidth=1.0)
-ax3.plot(cred_discount.index, cred_discount, color="purple", linewidth=1.0,
-         linestyle="--", label="Credibility proxy (NBU)")
-ax3.set_ylabel("Index (0–1)", fontsize=10)
-ax3.set_xlabel("Date", fontsize=11)
-ax3.legend(loc="upper right", fontsize=7, frameon=True)
+ax3.plot(regimes.index, regimes["fx_channel_weight"], color="darkorange", label="FX channel weight")
+ax3.plot(regimes.index, regimes["policy_channel_weight"], color="steelblue", label="Policy channel weight")
+ax3.plot(regimes.index, regimes["credibility_gain_weight"], color="purple", linestyle="--", label="Credibility weight")
+ax3.set_ylabel("0-1 weight")
+ax3.set_xlabel("Date")
+ax3.set_ylim(-0.05, 1.05)
 ax3.grid(True, alpha=0.2)
-ax3.set_ylim(-0.05, 1.15)
+ax3.legend(loc="upper right", ncol=3, fontsize=8, frameon=True)
 
 fig.savefig(os.path.join(FIG_DIR, "fig_counterfactual_main.png"), dpi=200, bbox_inches="tight")
-print("Saved: fig_counterfactual_main.png")
+plt.close(fig)
+print("\nSaved: fig_counterfactual_main.png")
 
-# ── SENSITIVITY FIGURE ──
+
 fig2, ax = plt.subplots(figsize=(14, 6))
-ax.plot(ua.index, ua, color="red", linewidth=2, label="Ukraine (actual)")
-for gname, cf_g in cf_variants_grouping.items():
-    ls = "-" if "Periph" in gname else ("--" if "Core" in gname else "-.")
-    ax.plot(cf_g.index, cf_g, linewidth=1.2, linestyle=ls,
-            label=f"CF: {gname}", alpha=0.8)
-ax.plot(cf_final.index, cf_final, color="darkgreen", linewidth=2,
-        label="CF: Main (regime-aware + credibility)")
-ax.plot(ea.index, ea_simple_avg, color="grey", linewidth=0.8,
-        linestyle=":", label="EA-11 simple mean")
-ax.axhline(0, color="black", linewidth=0.5, linestyle=":")
-ax.set_ylabel("Year-on-year inflation (%)")
-ax.set_title("Sensitivity: Counterfactual Under Different EA Groupings", fontsize=13)
-ax.legend(fontsize=8, frameon=True, ncol=2)
+gap_table = pd.concat(
+    [
+        (analysis["UA"] - cf_lp).rename("LP"),
+        (analysis["UA"] - cf_svar).rename("SVAR"),
+        (analysis["UA"] - cf_ascm).rename("ASCM"),
+        (analysis["UA"] - cf_factor).rename("Factor"),
+    ],
+    axis=1,
+)
+for col, color in [("LP", "teal"), ("SVAR", "navy"), ("ASCM", "darkorange"), ("Factor", "grey")]:
+    ax.plot(gap_table.index, gap_table[col], linewidth=1.1, color=color, label=f"Actual - {col}")
+ax.axhline(0, color="black", linewidth=0.5)
+ax.set_title("Method Comparison: Inflation Gap Between Actual Ukraine and Each Counterfactual")
+ax.set_ylabel("Percentage points")
+ax.set_xlabel("Date")
 ax.grid(True, alpha=0.2)
-ax.set_ylim(-5, 65)
+ax.legend(ncol=2, fontsize=8, frameon=True)
 fig2.tight_layout()
-fig2.savefig(os.path.join(FIG_DIR, "fig_sensitivity_groupings.png"), dpi=150)
-print("Saved: fig_sensitivity_groupings.png")
-
-# ── FACTOR LOADINGS BAR CHART ──
-fig3, ax = plt.subplots(figsize=(10, 5))
-colors = ["#e74c3c" if c in PERIPHERY else "#3498db" for c in EA_COLS]
-lambdas = [loadings[c]["lambda"] for c in EA_COLS]
-se_lambdas = [loadings[c]["se_lambda"] for c in EA_COLS]
-bars = ax.bar(range(len(EA_COLS)), lambdas, yerr=[1.96*s for s in se_lambdas],
-              color=colors, edgecolor="white", linewidth=0.5,
-              capsize=3, error_kw={"linewidth": 1})
-ax.set_xticks(range(len(EA_COLS)))
-ax.set_xticklabels(EA_COLS)
-ax.axhline(lambda_p, color="red", linestyle="--", linewidth=1.5,
-           label=f"Periphery avg = {lambda_p:.3f}")
-ax.axhline(1.0, color="grey", linestyle=":", linewidth=1,
-           label="λ = 1 (EA average)")
-ax.set_ylabel("Factor loading (λ) ± 95% CI")
-ax.set_title("EA Country Loadings on Common Inflation Factor")
-ax.legend(fontsize=9)
-ax.grid(True, alpha=0.2, axis="y")
-fig3.tight_layout()
-fig3.savefig(os.path.join(FIG_DIR, "fig_factor_loadings.png"), dpi=150)
-print("Saved: fig_factor_loadings.png")
-
-# ── STRUCTURAL BREAKS FIGURE ──
-fig4, (ax4a, ax4b) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
-                                    gridspec_kw={"hspace": 0.08})
-ax4a.plot(ua.index, ua, color="red", linewidth=1.5, label="Ukraine YoY inflation")
-for dt, fval in break_dates:
-    ax4a.axvline(dt, color="blue", alpha=0.4, linewidth=1, linestyle="--")
-ax4a.set_ylabel("Inflation (%)")
-ax4a.set_title("Structural Break Detection: Ukraine Inflation")
-ax4a.legend(fontsize=9)
-ax4a.grid(True, alpha=0.2)
-
-ax4b.plot(chow_stats.index, chow_stats, color="steelblue", linewidth=1)
-ax4b.axhline(F_CRIT, color="red", linestyle="--", label=f"F critical = {F_CRIT}")
-ax4b.fill_between(chow_stats.index, 0, chow_stats,
-                    where=chow_stats > F_CRIT, color="red", alpha=0.2)
-ax4b.set_ylabel("Chow F-statistic")
-ax4b.set_xlabel("Date")
-ax4b.legend(fontsize=9)
-ax4b.grid(True, alpha=0.2)
-fig4.tight_layout()
-fig4.savefig(os.path.join(FIG_DIR, "fig_structural_breaks.png"), dpi=150)
-print("Saved: fig_structural_breaks.png")
+fig2.savefig(os.path.join(FIG_DIR, "fig_counterfactual_methods.png"), dpi=180)
+plt.close(fig2)
+print("Saved: fig_counterfactual_methods.png")
 
 
-# =====================================================================
-# 12. INTERPRETATION (Deliverable 2)
-# =====================================================================
-print(f"\n{'─'*70}")
-print("12. ECONOMIC INTERPRETATION")
-print(f"{'─'*70}")
-
-gfc_gap = gap_boot["GFC"][1]
-crimea_gap = gap_boot["Crimea"][1]
-war_gap = gap_boot["Invasion"][1]
-
-interpretation = f"""
-BRIEF INTERPRETATION
-====================
-
-The counterfactual reveals that Euro Area membership would have dramatically
-reduced Ukraine's inflation volatility, but at the cost of eliminating the
-exchange-rate adjustment mechanism that cushioned three severe macro shocks.
-
-During the 2008-2009 GFC, the actual-counterfactual gap averages
-{gfc_gap:+.0f} pp (90% CI: [{gap_boot["GFC"][0]:+.0f}, {gap_boot["GFC"][2]:+.0f}]),
-reflecting the inflationary pass-through of the 38% hryvnia devaluation.
-Under the euro, adjustment would have required internal devaluation (wage
-and price deflation), as experienced by the Baltic states and Ireland.
-
-The 2014-2015 Crimea/Donbas crisis shows the largest divergence
-({crimea_gap:+.0f} pp, CI: [{gap_boot["Crimea"][0]:+.0f}, {gap_boot["Crimea"][2]:+.0f}]).
-Actual inflation peaked at 61% vs. a counterfactual of ~3-5%.  Under the
-euro, the currency crisis would have been replaced by a sovereign debt
-crisis (De Grauwe, 2012), potentially mitigated by ECB backstops (OMT)
-but requiring severe fiscal austerity.
-
-The 2022 invasion gap ({war_gap:+.0f} pp, CI: [{gap_boot["Invasion"][0]:+.0f}, {gap_boot["Invasion"][2]:+.0f}])
-is smaller because the NBU's wartime fixed rate already constrained the
-exchange rate, partially mimicking euro-like conditions.
-
-Post-2016, when the NBU adopted inflation targeting, the gap narrowed
-substantially.  This supports the Frankel-Rose (1998) endogeneity
-hypothesis: as Ukraine's institutions converged toward European standards,
-the marginal benefit of euro adoption diminished.  The cost of monetary
-sovereignty was largest precisely when that sovereignty was exercised
-most poorly.
-"""
-print(interpretation)
-
-
-# =====================================================================
-# 13. SAVE RESULTS
-# =====================================================================
 results = pd.DataFrame({
-    "UA_actual": ua,
-    "CF_factor_pure": cf_pure,
-    "CF_credibility_adj": cf_credibility,
-    "CF_final": cf_final,
-    "CF_90ci_lo": cf_lo_series,
-    "CF_90ci_hi": cf_hi_series,
-    "EA_simple_average": ea_simple_avg,
-    "F_EA_common_factor": F_EA,
-    "treatment_intensity": treatment,
-    "credibility_proxy": cred_discount,
+    "UA_actual": analysis["UA"],
+    "EA_factor": analysis["EA_FACTOR"],
+    "EA_mean": analysis["EA_MEAN"],
+    "FX_depreciation": analysis["FX_DEPR"],
+    "Policy_spread": analysis["POLICY_SPREAD"],
+    "Policy_shock": analysis["POLICY_SHOCK"],
+    "Ukraine_industry_yoy": analysis["UA_IP_YOY"],
+    "Ukraine_industry_gap": analysis["UA_IP_GAP"],
+    "EA_industry_yoy": analysis["EA_IP_YOY"],
+    "Brent_yoy": analysis["BRENT_YOY"],
+    "CF_factor_benchmark": cf_factor,
+    "CF_local_projections": cf_lp,
+    "CF_svar": cf_svar,
+    "CF_augmented_synthetic_control": cf_ascm,
+    "CF_main": cf_main,
+    "LP_removed_fx": lp_removed_fx,
+    "LP_removed_policy": lp_removed_policy,
+    "SVAR_removed_fx": svar_removed_fx,
+    "SVAR_removed_policy": svar_removed_policy,
+    "credibility_shift": credibility_shift,
+    "fx_channel_weight": regimes["fx_channel_weight"],
+    "policy_channel_weight": regimes["policy_channel_weight"],
+    "credibility_gain_weight": regimes["credibility_gain_weight"],
+    "euro_treatment_weight": regimes["euro_treatment_weight"],
 }).round(4)
 results.to_csv(os.path.join(DATA_DIR, "data_counterfactual_results.csv"))
-print("Saved: data_counterfactual_results.csv")
+donor_weights.to_csv(os.path.join(DATA_DIR, "data_ascm_weights.csv"), header=True)
 
-print("\nALL DELIVERABLES:")
-print("  1. fig_counterfactual_main.png      — Main 3-panel figure")
-print("  2. Interpretation (Section 12)      — With bootstrap CIs")
-print("  3. This script                      — Fully reproducible")
-print("  4. fig_sensitivity_groupings.png    — Core/Periphery/All comparison")
-print("  5. fig_factor_loadings.png          — Country loadings + 95% CI")
-print("  6. fig_scree_plot.png               — PCA component selection")
-print("  7. fig_structural_breaks.png        — Chow tests for regime detection")
+print("Saved: data_counterfactual_results.csv")
+print("Saved: data_ascm_weights.csv")
+
+print("\nInterpretation")
+print("- The structural core now removes the FX and policy-autonomy channels explicitly instead of blending back actual Ukraine inflation.")
+print("- The imported-credibility channel is strongest before the 2015-08 inflation-targeting transition and weaker thereafter, in line with Part A.")
+print("- Factor and donor-based methods are retained as benchmarks, not as the sole identification strategy.")
