@@ -240,9 +240,12 @@ def build_external_macro_panel(start: str, end: str) -> pd.DataFrame:
     ecb_ip = get_ecb_industrial_production(start, end)
     nbu_rate = get_nbu_key_rate().loc[start:end]
     fx_usd = get_nbu_exchange_monthly("USD", start, end)
+    fx_eur = get_nbu_exchange_monthly("EUR", start, end)
     ua_ip_yoy = get_ukraine_industry_yoy().loc[start:end]
     brent = get_fred_series("DCOILBRENTEU")
     brent = brent.resample("MS").mean().rename("BRENT")
+    wheat = get_fred_series("PWHEAMTUSDM").rename("WHEAT")
+    gas = get_fred_series("PNGASEUUSDM").rename("GAS")
 
     panel = pd.concat(
         [
@@ -250,8 +253,11 @@ def build_external_macro_panel(start: str, end: str) -> pd.DataFrame:
             ecb_ip.rename("EA_IP_INDEX"),
             nbu_rate.rename("NBU_KEY_RATE"),
             fx_usd.rename("UAH_USD"),
+            fx_eur.rename("UAH_EUR"),
             ua_ip_yoy.rename("UA_IP_YOY"),
             brent.rename("BRENT"),
+            wheat,
+            gas,
         ],
         axis=1,
     ).sort_index()
@@ -259,8 +265,11 @@ def build_external_macro_panel(start: str, end: str) -> pd.DataFrame:
     panel = panel.loc[start:end]
     panel["EA_IP_YOY"] = 100.0 * np.log(panel["EA_IP_INDEX"] / panel["EA_IP_INDEX"].shift(12))
     panel["BRENT_YOY"] = 100.0 * np.log(panel["BRENT"] / panel["BRENT"].shift(12))
+    panel["WHEAT_YOY"] = 100.0 * np.log(panel["WHEAT"] / panel["WHEAT"].shift(12))
+    panel["GAS_YOY"] = 100.0 * np.log(panel["GAS"] / panel["GAS"].shift(12))
     panel["FX_USD_DEPR"] = 100.0 * np.log(panel["UAH_USD"] / panel["UAH_USD"].shift(1))
-    panel["FX_DEPR"] = panel["FX_USD_DEPR"]
+    panel["FX_EUR_DEPR"] = 100.0 * np.log(panel["UAH_EUR"] / panel["UAH_EUR"].shift(1))
+    panel["FX_DEPR"] = panel["FX_EUR_DEPR"]  # EUR more relevant for Euro counterfactual
     panel["POLICY_SPREAD"] = panel["NBU_KEY_RATE"] - panel["EA_MRO"]
     panel["POLICY_SPREAD_CHG"] = panel["POLICY_SPREAD"].diff()
 

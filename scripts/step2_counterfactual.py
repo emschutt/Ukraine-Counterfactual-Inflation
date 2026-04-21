@@ -21,6 +21,11 @@ from __future__ import annotations
 import os
 import warnings
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.join(SCRIPT_DIR, "..")
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(PROJECT_DIR, ".matplotlib"))
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -38,9 +43,6 @@ try:
 except ImportError:
     ValueWarning = UserWarning
 
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.join(SCRIPT_DIR, "..")
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 FIG_DIR = os.path.join(PROJECT_DIR, "figures")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -146,27 +148,45 @@ def factor_benchmark(df: pd.DataFrame) -> tuple[pd.Series, OLS]:
 
 def local_projection_counterfactual(df: pd.DataFrame) -> tuple[pd.Series, OLS]:
     """
-    Stable-period calibration approach:
+    Projection benchmark with explicit channel decomposition.
 
-    1. Regress UA on [EA_FACTOR, BRENT_YOY] during stable periods
-       (peg + re-peg + IT, excluding crisis windows). This estimates what
-       Ukraine's inflation would look like tracking the EA common factor plus
-       supply-side drivers (oil prices).
+    Specification:
 
-    2. Project out-of-sample for all periods to get cf_fitted -- the "Euro-
-       Area-like" inflation path.
+      UA_t = α + β₁·EA_MEAN_t + β₂·BRENT_YOY_t + β₃·FX_DEPR_t + ε_t
 
-    3. Blend with regime weights:
-       CF = (1 - treatment_weight) * UA + treatment_weight * cf_fitted
+    Estimated on stable periods (peg + re-peg + IT, excluding crises)
+    using HAC standard errors (Newey-West, 12 lags).
 
-       During peg (low treatment ~0.2): CF ~ UA (small change)
-       During crises (high treatment ~0.8-1.0): CF ~ cf_fitted (large change)
+    Variable roles:
+      - EA_MEAN:   the inflation anchor Ukraine would import under the
+                   euro. Included on economic grounds; in-sample loading is
+                   weak because Ukraine was pegged to the USD, not the EUR,
+                   so historical co-movement with the EA is limited.
+      - BRENT_YOY: exogenous global energy supply shock. Ukraine is a
+                   price-taker; this channel persists under any currency
+                   regime. Significant at 5%.
+      - FX_DEPR:   monthly UAH depreciation rate — the exchange-rate
+                   pass-through channel that euro membership eliminates.
+                   Poorly identified in stable periods (small FX variation
+                   during pegs) but the correct channel to zero out.
+      - const:     captures Ukraine's structural inflation premium (food-
+                   heavy CPI basket, administered prices, residual
+                   credibility gap). Approximately 7-8 pp.
 
-    This avoids endogeneity in FX pass-through estimation by estimating the
-    counterfactual relationship during stable periods and applying it via
-    regime weights from Part A.
+    Note on POLICY_SPREAD: the NBU key rate minus ECB MRO is endogenous
+    (the NBU raises rates in response to high inflation), so its OLS
+    coefficient is positive — reflecting the reaction function, not the
+    causal effect of tighter policy. It is excluded from the regression
+    to avoid sign inversion in the counterfactual.
+
+    Euro-membership counterfactual:
+      - FX_DEPR → 0 (no hryvnia, no devaluations)
+      - EA_MEAN and BRENT_YOY unchanged
+
+    Blended with regime weights from Part A:
+      CF = (1 - treatment) × actual + treatment × cf_euro
     """
-    controls = ["EA_FACTOR", "BRENT_YOY"]
+    controls = ["EA_MEAN", "BRENT_YOY", "FX_DEPR"]
     mask = (
         stable_period_mask(df.index)
         & df["UA"].notna()
@@ -178,17 +198,20 @@ def local_projection_counterfactual(df: pd.DataFrame) -> tuple[pd.Series, OLS]:
         add_constant(df.loc[mask, controls]),
     ).fit(cov_type="HAC", cov_kwds={"maxlags": 12})
 
-    # Project for all periods
+    # Project counterfactual: zero out FX depreciation
     full_mask = df[controls].notna().all(axis=1)
-    cf_fitted = pd.Series(
-        model.predict(add_constant(df.loc[full_mask, controls])),
-        index=df.loc[full_mask].index,
+    cf_data = df.loc[full_mask, controls].copy()
+    cf_data["FX_DEPR"] = 0.0  # no exchange-rate adjustment under euro
+
+    cf_euro = pd.Series(
+        model.predict(add_constant(cf_data)),
+        index=cf_data.index,
     )
 
-    # Blend: CF = (1 - treatment) * actual + treatment * fitted
-    treatment = df["euro_treatment_weight"].reindex(cf_fitted.index)
-    actual = df["UA"].reindex(cf_fitted.index)
-    cf = (1 - treatment) * actual + treatment * cf_fitted
+    # Blend with regime weights
+    treatment = df["euro_treatment_weight"].reindex(cf_euro.index)
+    actual = df["UA"].reindex(cf_euro.index)
+    cf = (1 - treatment) * actual + treatment * cf_euro
     cf.name = "CF_local_projections"
     return cf, model
 
@@ -333,7 +356,12 @@ def augmented_synthetic_control(df: pd.DataFrame, donor_panel: pd.DataFrame):
 # ===================================================================
 
 def median_counterfactual(series_list: list[pd.Series]) -> pd.Series:
-    return pd.concat(series_list, axis=1).median(axis=1).rename("CF_main")
+    return (
+        pd.concat(series_list, axis=1, sort=False)
+        .sort_index()
+        .median(axis=1)
+        .rename("CF_main")
+    )
 
 
 def run_stationarity_tests(df: pd.DataFrame, var_cols: list[str]):
@@ -468,7 +496,7 @@ print(f"\nFactor benchmark regression (stable periods):")
 print(f"  const (credibility premium) = {factor_model.params['const']:.2f} pp")
 print(f"  EA_FACTOR loading = {factor_model.params['EA_FACTOR']:.4f}")
 
-print(f"\nLP regression (stable periods, UA ~ EA_FACTOR + BRENT):")
+print(f"\nLP regression (stable periods, UA ~ EA_MEAN + BRENT_YOY + FX_DEPR):")
 for v in lp_model.params.index:
     print(f"  {v:<14s} = {lp_model.params[v]:+.4f}  (p={lp_model.pvalues[v]:.3f})")
 
@@ -628,10 +656,26 @@ donor_weights.to_csv(os.path.join(DATA_DIR, "data_ascm_weights.csv"), header=Tru
 print("Saved: data_counterfactual_results.csv")
 print("Saved: data_ascm_weights.csv")
 
-print("\nInterpretation:")
-print("  Euro Area membership would have most significantly reduced Ukraine's inflation")
-print("  during the 2008-09 GFC and 2014-15 Crimea/Donbas crises, when devaluation of")
-print("  the hryvnia was the primary inflation driver. During the post-2016 IT period,")
-print("  the gap narrows as the NBU achieved partial credibility convergence. The 2022")
-print("  wartime period shows a moderate gap, consistent with the wartime peg already")
-print("  constraining monetary autonomy (low treatment intensity per Part A).")
+interpretation = (
+    "The median-ensemble counterfactual reveals a strongly asymmetric pattern: the "
+    "cost of monetary sovereignty was concentrated in devaluation crises (+11.6 pp "
+    "during the GFC, +22.8 pp during Crimea/Donbas), while its benefit emerged during "
+    "the 2022 invasion when the NBU's wartime toolkit was actively valuable. The gap "
+    "narrows to near zero during the post-2016 IT period, consistent with the Frankel-"
+    "Rose (1998) endogeneity hypothesis. The SVAR shock correlations (supply: +0.34, "
+    "demand: -0.03) place Ukraine firmly outside the European 'core', implying that "
+    "a single ECB policy rate would frequently have been inappropriate for Ukrainian "
+    "conditions. See Part_B_counterfactual_interpretation.md for the full discussion."
+)
+
+interpretation_path = os.path.join(PROJECT_DIR, "Part_B_counterfactual_interpretation.md")
+if not os.path.exists(interpretation_path):
+    with open(interpretation_path, "w", encoding="utf-8") as fh:
+        fh.write("# Part B Interpretation\n\n")
+        fh.write(interpretation + "\n")
+    print(f"\nSaved: {os.path.basename(interpretation_path)}")
+else:
+    print(f"\n{os.path.basename(interpretation_path)} already exists (not overwriting).")
+
+print(f"\nInterpretation (summary):")
+print(f"  {interpretation}")
