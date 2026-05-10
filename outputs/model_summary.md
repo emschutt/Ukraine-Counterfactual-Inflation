@@ -101,6 +101,9 @@ Review outputs/svar_diagnostics.csv for details.
 - `data/data_counterfactual_results.csv`
 - `figures/fig_counterfactual_main_svar.png`
 - `figures/fig_counterfactual_robustness.png`
+- `figures/fig_robustness_ascm.png`
+- `figures/fig_robustness_reduced_form_projection.png`
+- `figures/fig_robustness_stationarity_svar.png`
 - `figures/fig_svar_stationarity_robustness.png`
 - `outputs/lp_diagnostics.csv`
 - `outputs/model_summary.md`

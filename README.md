@@ -44,13 +44,7 @@ These results suggest that monetary sovereignty was inflationary during the majo
 
 *Figure 1. Required Part B main figure: actual Ukraine YoY inflation and the main SVAR counterfactual inflation path, with bootstrap uncertainty band.*
 
-![Robustness Checks](figures/fig_counterfactual_robustness.png)
-
-*Figure 2. Appendix-style robustness comparison: the main SVAR counterfactual alongside the stationarity-robustness SVAR, reduced-form projection benchmark, and ASCM robustness check.*
-
-![Stationarity Robustness SVAR](figures/fig_svar_stationarity_robustness.png)
-
-*Figure 3. Baseline-versus-stationarity-robustness SVAR comparison showing that the qualitative episode conclusions survive the transformation.*
+Additional robustness figures are generated into `figures/`, but they are not displayed here because the hand-in should foreground the main SVAR counterfactual rather than the robustness SVAR plots.
 
 ## How To Run
 

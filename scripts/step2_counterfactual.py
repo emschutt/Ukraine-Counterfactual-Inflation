@@ -38,6 +38,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 from scipy.optimize import minimize
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools.tools import add_constant
@@ -1056,6 +1057,9 @@ output_files_created = [
     "figures/fig_counterfactual_main_svar.png",
     "figures/fig_counterfactual_robustness.png",
     "figures/fig_svar_stationarity_robustness.png",
+    "figures/fig_robustness_stationarity_svar.png",
+    "figures/fig_robustness_reduced_form_projection.png",
+    "figures/fig_robustness_ascm.png",
     "outputs/svar_diagnostics.csv",
     "outputs/svar_diagnostics.json",
     "outputs/svar_stationary_robustness_diagnostics.csv",
@@ -1073,13 +1077,23 @@ save_model_summary(all_model_diag, episode_summaries, OUTPUT_DIR, output_files_c
 # Figures
 # ===================================================================
 
+EVENT_WINDOWS = [
+    ("2008-09-01", "2009-06-01", "GFC (2008-09)", "#d4a017"),
+    ("2014-02-01", "2015-12-01", "Crimea/Donbas crisis (2014-15)", "#7e57c2"),
+    ("2022-02-01", "2023-06-01", "Full-scale invasion (2022-23)", "#d65a5a"),
+]
+
+
 def _shade_events(ax):
-    for s, e, lbl, clr in [
-        ("2008-09-01", "2009-06-01", "GFC", "orange"),
-        ("2014-02-01", "2015-12-01", "Crimea/Donbas", "purple"),
-        ("2022-02-01", "2023-06-01", "Full-scale invasion", "red"),
-    ]:
-        ax.axvspan(pd.Timestamp(s), pd.Timestamp(e), alpha=0.07, color=clr)
+    for start, end, _, color in EVENT_WINDOWS:
+        ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), alpha=0.10, color=color)
+
+
+def _event_legend_handles():
+    return [
+        Patch(facecolor=color, edgecolor="none", alpha=0.25, label=label)
+        for _, _, label, color in EVENT_WINDOWS
+    ]
 
 
 def _format_time_axis(ax):
@@ -1087,6 +1101,53 @@ def _format_time_axis(ax):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.xaxis.set_minor_locator(mdates.YearLocator(1))
     ax.tick_params(axis="x", rotation=0)
+
+
+def _add_dual_legends(ax, series_loc="upper left", event_loc="upper right", series_ncol=1):
+    series_legend = ax.legend(loc=series_loc, fontsize=9, frameon=True, ncol=series_ncol)
+    ax.add_artist(series_legend)
+    ax.legend(handles=_event_legend_handles(), loc=event_loc, fontsize=8, frameon=True)
+
+
+def _plot_robustness_single(
+    filename: str,
+    title: str,
+    robustness_series: pd.Series,
+    robustness_label: str,
+    robustness_color: str,
+):
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.plot(analysis.index, analysis["UA"], color="#b22222", linewidth=2.2, label="Ukraine actual YoY inflation")
+    ax.plot(cf_svar.index, cf_svar, color="#123a73", linewidth=2.0, label="Main SVAR counterfactual")
+    ax.fill_between(
+        svar_ci_lo.index,
+        svar_ci_lo,
+        svar_ci_hi,
+        color="#123a73",
+        alpha=0.08,
+        label="Main SVAR 90% CI",
+    )
+    ax.plot(
+        robustness_series.index,
+        robustness_series,
+        color=robustness_color,
+        linewidth=1.9,
+        linestyle="--",
+        label=robustness_label,
+    )
+    ax.axhline(0, color="black", linewidth=0.4, linestyle=":")
+    _shade_events(ax)
+    _format_time_axis(ax)
+    ax.set_ylabel("Year-on-year inflation (%)")
+    ax.set_xlabel("Date")
+    ax.set_ylim(-5, 65)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.15)
+    _add_dual_legends(ax, series_loc="upper left", event_loc="upper right")
+    fig.tight_layout()
+    fig.savefig(os.path.join(FIG_DIR, filename), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: figures/{filename}")
 
 # Figure 1: MAIN RESULT — actual vs SVAR counterfactual
 fig1, ax1 = plt.subplots(figsize=(14, 7))
@@ -1104,10 +1165,10 @@ ax1.set_title(
     fontsize=12,
     fontweight="bold",
 )
-ax1.legend(loc="upper left", fontsize=9, frameon=True)
 ax1.grid(True, alpha=0.15)
 ax1.set_ylim(-5, 65)
 ax1.set_xlabel("Date")
+_add_dual_legends(ax1, series_loc="upper left", event_loc="upper right")
 fig1.tight_layout()
 fig1.savefig(os.path.join(FIG_DIR, "fig_counterfactual_main_svar.png"), dpi=200, bbox_inches="tight")
 plt.close(fig1)
@@ -1131,10 +1192,10 @@ _format_time_axis(ax2)
 ax2.set_ylabel("Year-on-year inflation (%)")
 ax2.set_title("Robustness Checks Relative to the Main SVAR Counterfactual",
               fontsize=12, fontweight="bold")
-ax2.legend(loc="upper left", fontsize=8, frameon=True)
 ax2.grid(True, alpha=0.15)
 ax2.set_ylim(-5, 65)
 ax2.set_xlabel("Date")
+_add_dual_legends(ax2, series_loc="upper left", event_loc="upper right")
 fig2.tight_layout()
 fig2.savefig(os.path.join(FIG_DIR, "fig_counterfactual_robustness.png"), dpi=200, bbox_inches="tight")
 plt.close(fig2)
@@ -1154,14 +1215,36 @@ _format_time_axis(ax2b)
 ax2b.set_ylabel("Year-on-year inflation (%)")
 ax2b.set_title("Stationarity Robustness: Baseline SVAR vs First-Differenced-Inflation SVAR",
                fontsize=12, fontweight="bold")
-ax2b.legend(loc="upper left", fontsize=9, frameon=True)
 ax2b.grid(True, alpha=0.15)
 ax2b.set_ylim(-5, 65)
 ax2b.set_xlabel("Date")
+_add_dual_legends(ax2b, series_loc="upper left", event_loc="upper right")
 fig2b.tight_layout()
 fig2b.savefig(os.path.join(FIG_DIR, "fig_svar_stationarity_robustness.png"), dpi=200, bbox_inches="tight")
 plt.close(fig2b)
 print("Saved: figures/fig_svar_stationarity_robustness.png")
+
+_plot_robustness_single(
+    filename="fig_robustness_stationarity_svar.png",
+    title="Robustness Detail: Stationarity-Robustness SVAR vs Actual Inflation and Main SVAR",
+    robustness_series=cf_svar_robust,
+    robustness_label="Stationarity-robustness SVAR",
+    robustness_color="#7f1734",
+)
+_plot_robustness_single(
+    filename="fig_robustness_reduced_form_projection.png",
+    title="Robustness Detail: Reduced-Form Projection Benchmark vs Actual Inflation and Main SVAR",
+    robustness_series=cf_rfp,
+    robustness_label="Reduced-form projection benchmark",
+    robustness_color="#0f766e",
+)
+_plot_robustness_single(
+    filename="fig_robustness_ascm.png",
+    title="Robustness Detail: ASCM Benchmark vs Actual Inflation and Main SVAR",
+    robustness_series=cf_ascm,
+    robustness_label="ASCM robustness check",
+    robustness_color="#d97706",
+)
 
 # ===================================================================
 # Save outputs

@@ -4,7 +4,15 @@
 
 The required Part B figure is `figures/fig_counterfactual_main_svar.png`. It is the headline figure for the submission and shows only two series on the same axes: Ukraine actual year-on-year inflation and the main SVAR counterfactual inflation path under hypothetical Euro Area membership. The optional bootstrap confidence band is included only to communicate uncertainty around the main SVAR result.
 
-`figures/fig_counterfactual_robustness.png` and `figures/fig_svar_stationarity_robustness.png` are appendix-style robustness figures and should not be read as alternative headline results.
+![Main SVAR counterfactual](figures/fig_counterfactual_main_svar.png)
+
+*Figure B1. Main SVAR counterfactual: actual Ukraine inflation, the Ukraine-in-the-Euro-Area counterfactual, and the SVAR confidence band. The shaded yellow, purple, and red windows mark the GFC, the Crimea/Donbas crisis, and the full-scale invasion.*
+
+`figures/fig_counterfactual_robustness.png`, `figures/fig_svar_stationarity_robustness.png`, `figures/fig_robustness_stationarity_svar.png`, `figures/fig_robustness_reduced_form_projection.png`, and `figures/fig_robustness_ascm.png` are appendix-style robustness figures and should not be read as alternative headline results.
+
+## Robustness Figures
+
+The robustness checks are generated in two formats. First, the combined appendix plots compare the main SVAR result to the other counterfactual benchmarks. Second, each robustness method is also plotted individually against actual inflation and the main SVAR counterfactual for reference. These files are kept as appendix material rather than displayed as headline figures in Part B.
 
 ## Methodological Overview
 
