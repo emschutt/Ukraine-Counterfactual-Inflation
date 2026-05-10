@@ -4,7 +4,7 @@ This repository contains a reproducible take-home exam on a single research ques
 
 The project compares actual Ukraine YoY inflation with a counterfactual Ukraine-in-the-Euro-Area inflation path. The headline result is the main Blanchard-Quah SVAR counterfactual rather than a simple Euro Area average.
 
-## Assignment Structure
+## Structure
 
 The repository is organized around two connected parts.
 
