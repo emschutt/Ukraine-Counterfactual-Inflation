@@ -1,17 +1,35 @@
-# Part B — Interpretation
+# Part B — Counterfactual Interpretation
 
-## What does the counterfactual imply about the cost or benefit of monetary sovereignty for Ukraine?
+## Main Figure
 
-The median-ensemble counterfactual reveals a strongly asymmetric pattern: the cost of monetary sovereignty was concentrated in devaluation crises, while its benefit emerged precisely when Ukraine faced an existential shock.
+The required Part B figure is `figures/fig_counterfactual_main_svar.png`. It is the headline figure for the submission and shows only two series on the same axes: Ukraine actual year-on-year inflation and the main SVAR counterfactual inflation path under hypothetical Euro Area membership. The optional bootstrap confidence band is included only to communicate uncertainty around the main SVAR result.
 
-**2008–2009 (GFC).** The gap averages +11.6 pp (actual 19.9%, counterfactual 8.3%). The 38% hryvnia depreciation against the dollar transmitted directly into consumer prices through import pass-through — a channel that euro membership would have eliminated entirely. Under the euro, however, the real adjustment would have required internal devaluation (wage and price deflation), as experienced by Ireland and the Baltic states. The inflationary cost of the hryvnia's flexibility was therefore the mirror image of a deflationary adjustment that euro membership would have imposed (Giavazzi and Pagano, 1988).
+`figures/fig_counterfactual_robustness.png` and `figures/fig_svar_stationarity_robustness.png` are appendix-style robustness figures and should not be read as alternative headline results.
 
-**2014–2015 (Crimea and Donbas).** This is the episode where monetary sovereignty was most expensive: the gap reaches +22.8 pp (actual 31.6%, counterfactual 8.8%). The 200%+ devaluation, combined with the NBU's collapsed credibility, amplified domestic prices far beyond what any Euro Area member experienced. But De Grauwe (2012) cautions that a euro-member Ukraine facing the same geopolitical shock might have experienced a sovereign debt crisis instead — unable to devalue and without a national central bank as lender of last resort, the fiscal cost of the conflict would have materialised through sovereign spreads rather than consumer prices. The counterfactual therefore understates the full macroeconomic cost of the crisis under euro membership.
+## Methodological Overview
 
-**Post-2016 inflation targeting.** The gap narrows to near zero (+0.3 pp during 2017–2021). This is consistent with the Frankel and Rose (1998) endogeneity hypothesis: as the NBU adopted inflation targeting and built institutional credibility, Ukraine was already importing much of the nominal discipline that euro membership would have provided. The marginal benefit of the euro shrank as domestic institutions improved — suggesting that the OCA criteria became more favourable precisely as Ukraine reformed its monetary framework.
+The main specification is the **Blanchard-Quah SVAR**. Euro Area membership is operationalized as a shock-replacement exercise: Ukraine-specific supply shocks are preserved, while Ukraine domestic demand and monetary shocks are replaced with Euro Area demand shocks. Demand and monetary shocks are restricted to have zero long-run effect on output, while supply shocks may have permanent effects on output.
 
-**2022–2023 (full-scale invasion).** The ensemble gap is small (+1.9 pp), but the individual methods diverge sharply. The SVAR actually implies Ukraine would have had *higher* inflation under the euro (+27.4% vs 20.5%), because the NBU's wartime toolkit — capital controls, administrative exchange-rate fixing, and direct monetary financing — would have been unavailable under euro membership. This suggests that for an economy facing existential geopolitical risk, the loss of monetary sovereignty carries costs that standard OCA analysis underestimates. Euro membership eliminates currency crises but also removes the ability to use the exchange rate and capital controls as emergency stabilisers.
+Part A matters directly for the construction of Part B. The regime chronology determines the treatment intensity of hypothetical Euro Area membership. The treatment is smaller during de facto peg periods, larger during the devaluation episodes and the post-2016 inflation-targeting period, and constrained again during the wartime fixed-rate and capital-control regime.
 
-**Structural shock asymmetry.** The Bayoumi-Eichengreen shock correlations reinforce this narrative: Ukraine's supply shocks are moderately correlated with the Euro Area (r = +0.34, reflecting shared global commodity exposure), but demand shocks are essentially uncorrelated (r = -0.03). This places Ukraine firmly outside the European "core" of symmetric business cycles, implying that a single ECB policy rate would frequently have been inappropriate for Ukrainian conditions (Mundell, 1961; McKinnon, 1963; Kenen, 1969).
+The reduced-form projection benchmark and the ASCM specification are retained only as robustness checks. The reduced-form projection is a single-horizon OLS benchmark, not a local projection. The stationarity-robustness SVAR is the main robustness exercise because it preserves the structural identification logic of the baseline model.
 
-**Bottom line.** Euro membership would have been most beneficial before 2016, when Ukraine lacked monetary credibility and suffered repeated devaluations. After the adoption of inflation targeting, the gains diminish substantially. And during wartime, the flexibility of an independent currency appears to have been actively valuable — a result that complicates the simple "credibility import" narrative and highlights the trade-off at the heart of optimal currency area theory.
+## Stationarity Robustness
+
+The baseline SVAR in levels exhibits instability because Ukraine inflation contains large structural breaks and crisis episodes. As a robustness exercise, the model is re-estimated on first-differenced inflation while preserving the same Blanchard-Quah identification and shock-replacement logic. Structural IRFs for the differenced system are cumulated back to inflation levels so the counterfactual remains directly comparable to the baseline figure.
+
+The qualitative conclusions are stable across the two SVAR specifications. The stationarity-robustness SVAR delivers larger magnitudes in the same key episodes: **+9.5 pp** in 2008-09, **+27.6 pp** in 2014-15, **-4.4 pp** after 2016, and **-8.4 pp** in 2022-23. The baseline interpretation therefore does not rest only on the unstable level VAR.
+
+## Interpretation
+
+The main SVAR counterfactual suggests that monetary sovereignty was inflationary during Ukraine's major devaluation crises, but that it became more valuable during the full-scale war once the exchange rate, capital controls, and emergency liquidity tools were actively used as crisis-management instruments.
+
+**2008-09 global financial crisis.** The main SVAR gap is **+5.7 pp**: actual inflation averages **19.9%**, versus a counterfactual **14.2%**. The implication is that the hryvnia devaluation transmitted inflation that Euro Area membership would likely have muted.
+
+**2014-15 Crimea/Donbas crisis.** This is the largest inflation cost of monetary sovereignty in the sample. The main SVAR gap is **+18.1 pp**: actual inflation averages **31.6%**, versus a counterfactual **13.5%**. The large devaluation and credibility collapse dominate the inflation outcome.
+
+**Post-2016 inflation-targeting period.** The sign reverses. The main SVAR gap is **-2.1 pp**: actual inflation averages **9.1%**, versus a counterfactual **11.2%**. Once the NBU established a more credible inflation-targeting framework, the marginal inflation benefit of Euro Area membership appears much smaller.
+
+**2022 full-scale invasion.** The main SVAR gap is **-6.8 pp**: actual inflation averages **20.5%**, versus a counterfactual **27.4%**. Under this interpretation, monetary sovereignty provided crisis-management tools that would have been harder to deploy inside the Euro Area.
+
+The broad message is therefore asymmetric. Euro membership would likely have lowered inflation during the two major devaluation crises, but the post-2016 and wartime episodes show that the value of monetary sovereignty depends on the institutional regime and the type of shock hitting the economy.

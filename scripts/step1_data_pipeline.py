@@ -271,4 +271,4 @@ if __name__ == "__main__":
     print("Saved: data_extended_hicp_panel.csv")
     print("Expanded donor countries:", list(donor_panel.columns))
 
-    print("\nData pipeline complete. Ready for Step 2 (SVAR, LP, and donor-based counterfactuals).")
+    print("\nData pipeline complete. Ready for Step 2 (main SVAR counterfactual plus robustness checks).")
